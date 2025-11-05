@@ -73,6 +73,8 @@ fi
 
 # 设置工作目录
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd /home/yanxi/loongson/aosp15.la
+source init.sh && source adb.sh
 cd "$SCRIPT_DIR"
 
 echo "═══════════════════════════════════════════════════════════"
