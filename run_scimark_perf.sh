@@ -10,6 +10,8 @@ LOCAL_OUTPUT_DIR="./perf-results"
 PERF_FREQUENCY=1000
 USE_JIT=false
 NO_UNWIND=false
+FLAMEGRAPH=false
+FLAMEGRAPH_DIR="/home/yanxi/loongson/aosp15.la/tmp/Perf/FlameGraph"
 
 # 显示帮助信息
 show_help() {
@@ -23,6 +25,7 @@ SciMark 2.0 性能分析脚本 - 使用 simpleperf 采集性能数据并生成�
     -o, --output <目录>        本地输出目录 (默认: ./perf-results)
     --jit                      启用 JIT 编译器 (默认: 禁用)
     --no-unwind                禁用调用栈展开 (默认: 启用展开)
+    --flamegraph               生成 FlameGraph 火焰图 (默认: 禁用)
     -h, --help                 显示此帮助信息
 
 示例:
@@ -31,6 +34,8 @@ SciMark 2.0 性能分析脚本 - 使用 simpleperf 采集性能数据并生成�
     $0 -f 2000                 # 使用 2000Hz 采样频率
     $0 --jit -f 2000           # 启用 JIT，使用 2000Hz 采样
     $0 --no-unwind             # 禁用调用栈展开（更快但信息较少）
+    $0 --flamegraph            # 生成 FlameGraph 火焰图
+    $0 --jit --flamegraph      # 启用 JIT 并生成火焰图
     $0 -o ./my-perf            # 指定输出目录
 
 输出文件:
@@ -59,6 +64,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-unwind)
             NO_UNWIND=true
+            shift
+            ;;
+        --flamegraph)
+            FLAMEGRAPH=true
             shift
             ;;
         -h|--help)
@@ -92,6 +101,7 @@ echo "测试日期: $(date)"
 echo "采样频率: ${PERF_FREQUENCY} Hz"
 echo "JIT 状态: $([ "$USE_JIT" = true ] && echo "启用" || echo "禁用")"
 echo "调用栈展开: $([ "$NO_UNWIND" = true ] && echo "禁用" || echo "启用")"
+echo "生成火焰图: $([ "$FLAMEGRAPH" = true ] && echo "是" || echo "否")"
 echo "输出目录: ${LOCAL_OUTPUT_DIR}"
 echo ""
 
@@ -190,25 +200,171 @@ echo ""
 
 # 尝试生成火焰图 (如果支持)
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "4. 生成火焰图 (可选)"
+echo "4. 生成火焰图"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-# 检查设备上是否有 report_html.py
-if adb shell "test -f /system/bin/report_html.py && echo exists" 2>/dev/null | grep -q "exists"; then
-    echo "生成 HTML 火焰图..."
-    adb shell "cd ${OUTPUT_DIR} && python3 /system/bin/report_html.py \
-    -i ${OUTPUT_DIR}/perf.data \
-    -o ${OUTPUT_DIR}/flamegraph.html" 2>/dev/null || echo "⚠️  火焰图生成失败"
+if [ "$FLAMEGRAPH" = true ]; then
+    echo "使用 FlameGraph 工具生成火焰图..."
     
-    if adb shell "test -f ${OUTPUT_DIR}/flamegraph.html && echo exists" 2>/dev/null | grep -q "exists"; then
-        adb pull ${OUTPUT_DIR}/flamegraph.html "${LOCAL_OUTPUT_DIR}/flamegraph-${JIT_DESC}.html"
-        echo "✅ 火焰图已保存: ${LOCAL_OUTPUT_DIR}/flamegraph-${JIT_DESC}.html"
+    # 检查 FlameGraph 工具是否存在
+    if [ ! -f "${FLAMEGRAPH_DIR}/flamegraph.pl" ]; then
+        echo "❌ 找不到 FlameGraph 工具: ${FLAMEGRAPH_DIR}/flamegraph.pl"
+        echo "   请确认 FlameGraph 目录路径正确"
+    else
+        # 检查转换脚本是否存在
+        CONVERT_SCRIPT="${LOCAL_OUTPUT_DIR}/convert_simpleperf_to_folded.py"
+        if [ ! -f "${CONVERT_SCRIPT}" ]; then
+            echo "⚠️  转换脚本不存在，正在创建..."
+            cat > "${CONVERT_SCRIPT}" << 'PYTHON_SCRIPT'
+#!/usr/bin/env python3
+"""
+将 simpleperf report-sample 的输出转换为 FlameGraph 折叠格式
+"""
+import sys
+import re
+
+def parse_simpleperf_output(input_file):
+    """解析 simpleperf report-sample 的输出"""
+    samples = []
+    current_sample = None
+    callchain = []
+    
+    with open(input_file, 'r', encoding='utf-8', errors='ignore') as f:
+        for line in f:
+            line = line.rstrip()
+            
+            if line.startswith('sample:'):
+                # 保存前一个样本
+                if current_sample and callchain:
+                    samples.append((current_sample, list(reversed(callchain))))
+                
+                # 开始新样本
+                current_sample = {}
+                callchain = []
+                
+            elif line.startswith('  event_count:'):
+                match = re.search(r'event_count:\s*(\d+)', line)
+                if match:
+                    current_sample['count'] = int(match.group(1))
+                    
+            elif line.startswith('  thread_name:'):
+                match = re.search(r'thread_name:\s*(.+)', line)
+                if match:
+                    current_sample['thread'] = match.group(1).strip()
+                    
+            elif line.startswith('  symbol:'):
+                match = re.search(r'symbol:\s*(.+)', line)
+                if match:
+                    symbol = match.group(1).strip()
+                    if not current_sample.get('main_symbol'):
+                        current_sample['main_symbol'] = symbol
+                        
+            elif line.startswith('    symbol:'):
+                # 调用栈中的符号
+                match = re.search(r'symbol:\s*(.+)', line)
+                if match:
+                    symbol = match.group(1).strip()
+                    callchain.append(symbol)
+        
+        # 保存最后一个样本
+        if current_sample and callchain:
+            samples.append((current_sample, list(reversed(callchain))))
+    
+    return samples
+
+def convert_to_folded(samples):
+    """转换为折叠格式"""
+    folded_stacks = {}
+    
+    for sample, callchain in samples:
+        if not callchain:
+            continue
+            
+        # 添加主符号到调用栈
+        if 'main_symbol' in sample:
+            full_stack = callchain + [sample['main_symbol']]
+        else:
+            full_stack = callchain
+        
+        # 创建折叠的栈字符串
+        stack_str = ';'.join(full_stack)
+        count = sample.get('count', 1)
+        
+        # 累加相同栈的计数
+        if stack_str in folded_stacks:
+            folded_stacks[stack_str] += count
+        else:
+            folded_stacks[stack_str] = count
+    
+    return folded_stacks
+
+def main():
+    if len(sys.argv) < 2:
+        print(f"用法: {sys.argv[0]} <simpleperf-output-file>", file=sys.stderr)
+        sys.exit(1)
+    
+    input_file = sys.argv[1]
+    
+    # 解析样本
+    samples = parse_simpleperf_output(input_file)
+    print(f"解析了 {len(samples)} 个样本", file=sys.stderr)
+    
+    # 转换为折叠格式
+    folded = convert_to_folded(samples)
+    print(f"生成了 {len(folded)} 个唯一调用栈", file=sys.stderr)
+    
+    # 输出折叠格式
+    for stack, count in sorted(folded.items(), key=lambda x: x[1], reverse=True):
+        print(f"{stack} {count}")
+
+if __name__ == '__main__':
+    main()
+PYTHON_SCRIPT
+            chmod +x "${CONVERT_SCRIPT}"
+            echo "✅ 转换脚本创建完成"
+        fi
+        
+        # 步骤1: 从设备导出 simpleperf 原始数据
+        echo "步骤 1/3: 导出调用栈数据..."
+        adb shell "/system/bin/simpleperf report-sample -i ${OUTPUT_DIR}/perf.data --show-callchain" > "${LOCAL_OUTPUT_DIR}/perf-${JIT_DESC}-raw.txt" 2>&1
+        
+        if [ -s "${LOCAL_OUTPUT_DIR}/perf-${JIT_DESC}-raw.txt" ]; then
+            echo "✅ 调用栈数据导出完成"
+            
+            # 步骤2: 转换为折叠格式
+            echo "步骤 2/3: 转换为折叠格式..."
+            python3 "${CONVERT_SCRIPT}" "${LOCAL_OUTPUT_DIR}/perf-${JIT_DESC}-raw.txt" > "${LOCAL_OUTPUT_DIR}/perf-${JIT_DESC}.folded" 2>&1
+            
+            # 步骤3: 生成火焰图
+            echo "步骤 3/3: 生成火焰图 SVG..."
+            tail -n +3 "${LOCAL_OUTPUT_DIR}/perf-${JIT_DESC}.folded" | \
+                "${FLAMEGRAPH_DIR}/flamegraph.pl" \
+                --title "SciMark 2.0 Performance - ${JIT_DESC}" \
+                --colors java \
+                --width 1800 \
+                > "${LOCAL_OUTPUT_DIR}/flamegraph-${JIT_DESC}.svg"
+            
+            if [ -f "${LOCAL_OUTPUT_DIR}/flamegraph-${JIT_DESC}.svg" ]; then
+                echo "✅ 火焰图已生成: ${LOCAL_OUTPUT_DIR}/flamegraph-${JIT_DESC}.svg"
+                echo "   可以使用浏览器打开查看"
+            else
+                echo "❌ 火焰图生成失败"
+            fi
+        else
+            echo "❌ 调用栈数据导出失败"
+        fi
     fi
 else
-    echo "⚠️  设备上没有 report_html.py，跳过火焰图生成"
-    echo "   提示: 可以在主机上使用 simpleperf 工具链生成火焰图"
+    echo "⚠️  未启用 FlameGraph 生成，使用 --flamegraph 选项启用"
 fi
 
+# 检查设备上是否有 report_html.py (simpleperf 内置火焰图)
+if [ "$FLAMEGRAPH" = false ]; then
+    if adb shell "test -f /system/bin/report_html.py && echo exists" 2>/dev/null | grep -q "exists"; then
+        echo ""
+        echo "提示: 设备支持 simpleperf 内置火焰图，可以使用 --flamegraph 选项生成"
+    fi
+fi
 echo ""
 echo "═══════════════════════════════════════════════════════════"
 echo "     性能分析完成"
@@ -218,6 +374,9 @@ echo "输出文件位置: ${LOCAL_OUTPUT_DIR}/"
 echo "  - perf-${JIT_DESC}.data                    原始性能数据"
 echo "  - perf-report-${JIT_DESC}.txt              符号报告（按符号排序）"
 echo "  - perf-report-${JIT_DESC}-callgraph.txt    调用图报告（含调用栈）"
+if [ -f "${LOCAL_OUTPUT_DIR}/flamegraph-${JIT_DESC}.svg" ]; then
+    echo "  - flamegraph-${JIT_DESC}.svg               FlameGraph 火焰图"
+fi
 if [ -f "${LOCAL_OUTPUT_DIR}/flamegraph-${JIT_DESC}.html" ]; then
     echo "  - flamegraph-${JIT_DESC}.html              火焰图"
 fi
@@ -225,6 +384,9 @@ echo ""
 echo "提示: 可以使用以下命令查看详细报告:"
 echo "  less ${LOCAL_OUTPUT_DIR}/perf-report-${JIT_DESC}.txt             # 查看符号报告"
 echo "  less ${LOCAL_OUTPUT_DIR}/perf-report-${JIT_DESC}-callgraph.txt   # 查看调用栈"
+if [ -f "${LOCAL_OUTPUT_DIR}/flamegraph-${JIT_DESC}.svg" ]; then
+    echo "  firefox ${LOCAL_OUTPUT_DIR}/flamegraph-${JIT_DESC}.svg          # 浏览器查看 FlameGraph 火焰图"
+fi
 if [ -f "${LOCAL_OUTPUT_DIR}/flamegraph-${JIT_DESC}.html" ]; then
     echo "  firefox ${LOCAL_OUTPUT_DIR}/flamegraph-${JIT_DESC}.html"
 fi
