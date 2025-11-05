@@ -9,6 +9,7 @@ OUTPUT_DIR="/data/tmp/scimark-perf"
 LOCAL_OUTPUT_DIR="./perf-results"
 PERF_FREQUENCY=1000
 USE_JIT=false
+NO_UNWIND=false
 
 # 显示帮助信息
 show_help() {
@@ -21,13 +22,15 @@ SciMark 2.0 性能分析脚本 - 使用 simpleperf 采集性能数据并生成�
     -f, --frequency <频率>     采样频率 (默认: 1000 Hz)
     -o, --output <目录>        本地输出目录 (默认: ./perf-results)
     --jit                      启用 JIT 编译器 (默认: 禁用)
+    --no-unwind                禁用调用栈展开 (默认: 启用展开)
     -h, --help                 显示此帮助信息
 
 示例:
-    $0                         # 使用默认参数运行 (禁用 JIT)
+    $0                         # 使用默认参数运行 (禁用 JIT，启用调用栈展开)
     $0 --jit                   # 启用 JIT 编译器
     $0 -f 2000                 # 使用 2000Hz 采样频率
     $0 --jit -f 2000           # 启用 JIT，使用 2000Hz 采样
+    $0 --no-unwind             # 禁用调用栈展开（更快但信息较少）
     $0 -o ./my-perf            # 指定输出目录
 
 输出文件:
@@ -52,6 +55,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --jit)
             USE_JIT=true
+            shift
+            ;;
+        --no-unwind)
+            NO_UNWIND=true
             shift
             ;;
         -h|--help)
@@ -84,6 +91,7 @@ echo ""
 echo "测试日期: $(date)"
 echo "采样频率: ${PERF_FREQUENCY} Hz"
 echo "JIT 状态: $([ "$USE_JIT" = true ] && echo "启用" || echo "禁用")"
+echo "调用栈展开: $([ "$NO_UNWIND" = true ] && echo "禁用" || echo "启用")"
 echo "输出目录: ${LOCAL_OUTPUT_DIR}"
 echo ""
 
@@ -132,14 +140,15 @@ jnt.scimark2.commandline"
 
 # 运行 simpleperf
 echo "开始采集性能数据..."
-echo "命令: simpleperf record -g -f ${PERF_FREQUENCY} --no-unwind ..."
+UNWIND_FLAG=$([ "$NO_UNWIND" = true ] && echo "--no-unwind" || echo "")
+echo "命令: simpleperf record -g -f ${PERF_FREQUENCY} ${UNWIND_FLAG} ..."
 echo ""
 
 adb shell "/system/bin/simpleperf record \
 -g \
 -f ${PERF_FREQUENCY} \
 -o ${OUTPUT_DIR}/perf.data \
---no-unwind \
+${UNWIND_FLAG} \
 ${DALVIKVM_CMD}" 2>&1 | tee /tmp/perf-output.txt | grep -E "Composite Score:|FFT|SOR|Monte|Sparse|LU"
 
 echo ""
