@@ -221,15 +221,23 @@ if [ "$FLAMEGRAPH" = true ]; then
         fi
         
         # 步骤1: 从设备导出 simpleperf 原始数据
-        echo "步骤 1/3: 导出调用栈数据..."
+        echo "步骤 1/3: 导出调用栈数据 (设备端)..."
+        
+        # 使用设备端 simpleperf 导出原始数据 (包含 vaddr)
         adb shell "/system/bin/simpleperf report-sample -i ${OUTPUT_DIR}/perf.data --show-callchain" > "${LOCAL_OUTPUT_DIR}/perf-${JIT_DESC}-raw.txt" 2>&1
         
         if [ -s "${LOCAL_OUTPUT_DIR}/perf-${JIT_DESC}-raw.txt" ]; then
             echo "✅ 调用栈数据导出完成"
             
-            # 步骤2: 转换为折叠格式
-            echo "步骤 2/3: 转换为折叠格式..."
-            python3 "${CONVERT_SCRIPT}" "${LOCAL_OUTPUT_DIR}/perf-${JIT_DESC}-raw.txt" > "${LOCAL_OUTPUT_DIR}/perf-${JIT_DESC}.folded" 2>&1
+            # 步骤2: 解析符号并转换为折叠格式
+            echo "步骤 2/3: 解析符号并转换为折叠格式..."
+            RESOLVE_SCRIPT="${SCRIPT_DIR}/resolve_and_fold.py"
+            if [ ! -f "${RESOLVE_SCRIPT}" ]; then
+                 echo "❌ 找不到解析脚本: ${RESOLVE_SCRIPT}"
+                 exit 1
+            fi
+            
+            python3 "${RESOLVE_SCRIPT}" "${LOCAL_OUTPUT_DIR}/perf-${JIT_DESC}-raw.txt" > "${LOCAL_OUTPUT_DIR}/perf-${JIT_DESC}.folded" 2>&1
             
             # 步骤3: 生成火焰图
             echo "步骤 3/3: 生成火焰图 SVG..."

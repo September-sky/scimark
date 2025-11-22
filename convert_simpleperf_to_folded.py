@@ -10,47 +10,70 @@ def parse_simpleperf_output(input_file):
     samples = []
     current_sample = None
     callchain = []
+    in_callchain = False
+    
+    # 统计信息
+    total_lines = 0
+    sample_count = 0
     
     with open(input_file, 'r', encoding='utf-8', errors='ignore') as f:
         for line in f:
-            line = line.rstrip()
+            total_lines += 1
+            line_stripped = line.strip()
             
             if line.startswith('sample:'):
                 # 保存前一个样本
-                if current_sample and callchain:
-                    samples.append((current_sample, list(reversed(callchain))))
+                if current_sample:
+                    # 如果 callchain 为空，尝试使用 main_symbol
+                    if not callchain and current_sample.get('main_symbol'):
+                        callchain = [current_sample['main_symbol']]
+                    
+                    if callchain:
+                        # simpleperf callchain 通常是 leaf -> root
+                        # FlameGraph 需要 root -> leaf
+                        stack = list(reversed(callchain))
+                        samples.append((current_sample, stack))
                 
                 # 开始新样本
                 current_sample = {}
                 callchain = []
+                in_callchain = False
+                sample_count += 1
                 
-            elif line.startswith('  event_count:'):
+            elif line_stripped.startswith('event_count:'):
                 match = re.search(r'event_count:\s*(\d+)', line)
                 if match:
                     current_sample['count'] = int(match.group(1))
                     
-            elif line.startswith('  thread_name:'):
+            elif line_stripped.startswith('thread_name:'):
                 match = re.search(r'thread_name:\s*(.+)', line)
                 if match:
                     current_sample['thread'] = match.group(1).strip()
-                    
-            elif line.startswith('  symbol:'):
+            
+            elif line_stripped.startswith('callchain:'):
+                in_callchain = True
+                
+            elif line_stripped.startswith('symbol:'):
                 match = re.search(r'symbol:\s*(.+)', line)
                 if match:
                     symbol = match.group(1).strip()
-                    if not current_sample.get('main_symbol'):
-                        current_sample['main_symbol'] = symbol
-                        
-            elif line.startswith('    symbol:'):
-                # 调用栈中的符号
-                match = re.search(r'symbol:\s*(.+)', line)
-                if match:
-                    symbol = match.group(1).strip()
-                    callchain.append(symbol)
+                    if in_callchain:
+                        callchain.append(symbol)
+                    else:
+                        if not current_sample.get('main_symbol'):
+                            current_sample['main_symbol'] = symbol
         
         # 保存最后一个样本
-        if current_sample and callchain:
-            samples.append((current_sample, list(reversed(callchain))))
+        if current_sample:
+             if not callchain and current_sample.get('main_symbol'):
+                callchain = [current_sample['main_symbol']]
+             if callchain:
+                stack = list(reversed(callchain))
+                samples.append((current_sample, stack))
+    
+    print(f"处理了 {total_lines} 行", file=sys.stderr)
+    print(f"发现 {sample_count} 个样本标记", file=sys.stderr)
+    print(f"成功解析 {len(samples)} 个有效样本 (含调用栈)", file=sys.stderr)
     
     return samples
 
@@ -58,15 +81,18 @@ def convert_to_folded(samples):
     """转换为折叠格式"""
     folded_stacks = {}
     
-    for sample, callchain in samples:
-        if not callchain:
+    for sample, full_stack in samples:
+        if not full_stack:
             continue
             
-        # 添加主符号到调用栈
+        # 检查是否需要添加 main_symbol
+        # 如果栈顶不是 main_symbol，且 main_symbol 存在，则添加
+        # 注意：full_stack 是 root -> leaf
         if 'main_symbol' in sample:
-            full_stack = callchain + [sample['main_symbol']]
-        else:
-            full_stack = callchain
+            main_sym = sample['main_symbol']
+            if full_stack[-1] != main_sym:
+                # 只有当栈顶不匹配 main_symbol 时才添加，避免重复
+                full_stack.append(main_sym)
         
         # 创建折叠的栈字符串
         stack_str = ';'.join(full_stack)
@@ -89,7 +115,6 @@ def main():
     
     # 解析样本
     samples = parse_simpleperf_output(input_file)
-    print(f"解析了 {len(samples)} 个样本", file=sys.stderr)
     
     # 转换为折叠格式
     folded = convert_to_folded(samples)
