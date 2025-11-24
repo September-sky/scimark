@@ -1,6 +1,127 @@
 #!/bin/bash
+
+set -o pipefail
+
+usage() {
+  cat <<'EOF'
+用法: ./art_run_local.sh [脚本选项] [--] [SciMark 参数]
+
+脚本选项:
+  --flamegraph               使用 perf+FlameGraph 生成火焰图
+  --flamegraph-output PATH   指定 SVG 输出路径 (默认: ./local-perf-result/<时间戳>-<模式...>/scimark-perf.svg)
+  --perf-frequency N         perf 采样频率 (默认 1000 Hz)
+  --perf-bin PATH            指定 perf 可执行文件
+  --perf-mmap-pages N        perf 缓冲区页数 (默认 1024，0 表示不设置)
+  --interpreter              强制解释模式 (默认)
+  --switch-interpreter       使用 switch-interpreter (等价 -Xint)
+  --jit                      启用 JIT（默认关闭，走解释器）
+  --jit-on-first-use         激进 JIT，首次调用立即编译
+  -h, --help                 显示此帮助
+
+SciMark 原生参数:
+  -large                     使用大规模测试
+  <minimum_time>             每个子项最少运行秒数
+EOF
+}
+
 AOSP="/home/yanxi/loongson/aosp15.la"
 AOSP_OUT_HOST="$AOSP/out/host/linux-x86"
+FLAMEGRAPH_ROOT="/home/yanxi/loongson/aosp15.la/tmp/Perf/FlameGraph"
+PERF_FREQ=1000
+PERF_BIN="$(command -v perf 2>/dev/null)"
+FLAMEGRAPH_OUTPUT=""
+PERF_OUTPUT_ROOT="./local-perf-result"
+ENABLE_FLAMEGRAPH=0
+JIT_MODE="interpreter"
+PERF_MMAP_PAGES=1024
+
+SCIMARK_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --flamegraph)
+      ENABLE_FLAMEGRAPH=1
+      shift
+      ;;
+    --flamegraph-output)
+      if [[ -z "${2:-}" ]]; then
+        echo "[错误] --flamegraph-output 需要参数" >&2
+        exit 1
+      fi
+      FLAMEGRAPH_OUTPUT="$2"
+      shift 2
+      ;;
+    --perf-frequency)
+      if [[ -z "${2:-}" ]]; then
+        echo "[错误] --perf-frequency 需要参数" >&2
+        exit 1
+      fi
+      PERF_FREQ="$2"
+      shift 2
+      ;;
+    --perf-bin)
+      if [[ -z "${2:-}" ]]; then
+        echo "[错误] --perf-bin 需要参数" >&2
+        exit 1
+      fi
+      PERF_BIN="$2"
+      shift 2
+      ;;
+    --perf-mmap-pages)
+      if [[ -z "${2:-}" ]]; then
+        echo "[错误] --perf-mmap-pages 需要参数" >&2
+        exit 1
+      fi
+      if ! [[ "$2" =~ ^[0-9]+$ ]]; then
+        echo "[错误] --perf-mmap-pages 只能是非负整数" >&2
+        exit 1
+      fi
+      PERF_MMAP_PAGES="$2"
+      shift 2
+      ;;
+    --interpreter)
+      JIT_MODE="interpreter"
+      shift
+      ;;
+    --switch-interpreter)
+      if [[ "${JIT_MODE}" == "jit" || "${JIT_MODE}" == "jit-first" ]]; then
+        echo "[错误] --switch-interpreter 不能与 --jit 或 --jit-on-first-use 同时使用" >&2
+        exit 1
+      fi
+      JIT_MODE="switch"
+      shift
+      ;;
+    --jit)
+      if [[ "${JIT_MODE}" == "switch" ]]; then
+        echo "[错误] --jit 不能与 --switch-interpreter 同时使用" >&2
+        exit 1
+      fi
+      JIT_MODE="jit"
+      shift
+      ;;
+    --jit-on-first-use)
+      if [[ "${JIT_MODE}" == "switch" ]]; then
+        echo "[错误] --jit-on-first-use 不能与 --switch-interpreter 同时使用" >&2
+        exit 1
+      fi
+      JIT_MODE="jit-first"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      SCIMARK_ARGS+=("$@")
+      break
+      ;;
+    *)
+      SCIMARK_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
 
 BOOTCLASSPATH="${AOSP_OUT_HOST}/apex/com.android.art/javalib/core-oj.jar:${AOSP_OUT_HOST}/apex/com.android.art/javalib/core-libart.jar:${AOSP_OUT_HOST}/apex/com.android.art/javalib/okhttp.jar:${AOSP_OUT_HOST}/apex/com.android.art/javalib/bouncycastle.jar:${AOSP_OUT_HOST}/apex/com.android.art/javalib/apache-xml.jar:${AOSP_OUT_HOST}/apex/com.android.i18n/javalib/core-icu4j.jar:${AOSP_OUT_HOST}/apex/com.android.conscrypt/javalib/conscrypt.jar"
 
@@ -18,7 +139,116 @@ export PATH="${AOSP_OUT_HOST}/bin:${PATH}"
 
 mkdir -p "${ANDROID_DATA}"/dalvik-cache/x86_64
 
-"${AOSP_OUT_HOST}/bin/dalvikvm64" \
-  -Xbootclasspath:"${BOOTCLASSPATH}" \
-  -Xbootclasspath-locations:"${BOOTCLASSPATH}" \
-  -cp scimark-dex.jar jnt.scimark2.commandline "$@"
+jit_flags=()
+case "${JIT_MODE}" in
+  interpreter)
+    jit_flags+=("-Xusejit:false")
+    ;;
+  switch)
+    jit_flags+=("-Xint" "-Xusejit:false")
+    ;;
+  jit)
+    jit_flags+=("-Xusejit:true")
+    ;;
+  jit-first)
+    jit_flags+=("-Xusejit:true" "-Xjitthreshold:0")
+    ;;
+esac
+
+dalvik_cmd=(
+  "${AOSP_OUT_HOST}/bin/dalvikvm64"
+  "-Xbootclasspath:${BOOTCLASSPATH}"
+  "-Xbootclasspath-locations:${BOOTCLASSPATH}"
+)
+
+if [[ ${#jit_flags[@]} -gt 0 ]]; then
+  dalvik_cmd+=("${jit_flags[@]}")
+fi
+
+dalvik_cmd+=(
+  -cp
+  scimark-dex.jar
+  jnt.scimark2.commandline
+)
+
+if [[ ${#SCIMARK_ARGS[@]} -gt 0 ]]; then
+  dalvik_cmd+=("${SCIMARK_ARGS[@]}")
+fi
+
+if [[ ${ENABLE_FLAMEGRAPH} -eq 1 ]]; then
+  if [[ -z "${PERF_BIN}" || ! -x "${PERF_BIN}" ]]; then
+    echo "[错误] 找不到可执行的 perf，请安装或通过 --perf-bin 指定" >&2
+    exit 1
+  fi
+  if ! command -v perl >/dev/null 2>&1; then
+    echo "[错误] 生成火焰图需要 perl" >&2
+    exit 1
+  fi
+
+  STACK_COLLAPSE="${FLAMEGRAPH_ROOT}/stackcollapse-perf.pl"
+  FLAMEGRAPH_PL="${FLAMEGRAPH_ROOT}/flamegraph.pl"
+
+  if [[ ! -f "${STACK_COLLAPSE}" || ! -f "${FLAMEGRAPH_PL}" ]]; then
+    echo "[错误] 未找到 FlameGraph 脚本，请确认目录 ${FLAMEGRAPH_ROOT}" >&2
+    exit 1
+  fi
+
+  mode_name="interpreter"
+  case "${JIT_MODE}" in
+    interpreter)
+      mode_name="interpreter"
+      ;;
+    switch)
+      mode_name="switch-interpreter"
+      ;;
+    jit)
+      mode_name="jit"
+      ;;
+    jit-first)
+      mode_name="jit-on-first-use"
+      ;;
+  esac
+
+  arg_suffix=""
+  if [[ ${#SCIMARK_ARGS[@]} -gt 0 ]]; then
+    arg_suffix="$(printf -- "-%s" "${SCIMARK_ARGS[@]}")"
+    arg_suffix="${arg_suffix// /_}"
+    arg_suffix="${arg_suffix//$'\n'/_}"
+    arg_suffix="${arg_suffix//[^A-Za-z0-9_.-]/_}"
+  fi
+
+  timestamp="$(date +%Y%m%d-%H%M%S)"
+  run_dir="${PERF_OUTPUT_ROOT}/${timestamp}-${mode_name}${arg_suffix}"
+  mkdir -p "${run_dir}"
+
+  perf_data="${run_dir}/scimark-perf.data"
+  folded_txt="${run_dir}/scimark-perf.folded"
+  log_file="${run_dir}/scimark-run.log"
+
+  exec > >(tee -a "${log_file}") 2>&1
+  echo "[信息] 日志输出: ${log_file}" >&2
+
+  if [[ -z "${FLAMEGRAPH_OUTPUT}" ]]; then
+    FLAMEGRAPH_OUTPUT="${run_dir}/scimark-perf.svg"
+  else
+    mkdir -p "$(dirname "${FLAMEGRAPH_OUTPUT}")"
+  fi
+
+  echo "[信息] 使用 perf 采样，输出 ${perf_data}" >&2
+  perf_record_cmd=("${PERF_BIN}" record --call-graph dwarf -F "${PERF_FREQ}" -o "${perf_data}")
+  if [[ -n "${PERF_MMAP_PAGES}" && "${PERF_MMAP_PAGES}" != "0" ]]; then
+    perf_record_cmd+=(--mmap-pages "${PERF_MMAP_PAGES}")
+  fi
+  perf_record_cmd+=(-- "${dalvik_cmd[@]}")
+  "${perf_record_cmd[@]}"
+
+  echo "[信息] 生成折叠栈文件 ${folded_txt}" >&2
+  "${PERF_BIN}" script -i "${perf_data}" | perl "${STACK_COLLAPSE}" > "${folded_txt}"
+
+  echo "[信息] 生成火焰图 ${FLAMEGRAPH_OUTPUT}" >&2
+  perl "${FLAMEGRAPH_PL}" "${folded_txt}" > "${FLAMEGRAPH_OUTPUT}"
+
+  echo "[完成] 火焰图已生成: ${FLAMEGRAPH_OUTPUT}" >&2
+else
+  "${dalvik_cmd[@]}"
+fi
