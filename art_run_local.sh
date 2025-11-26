@@ -17,6 +17,9 @@ usage() {
   --jit                      启用 JIT（默认关闭，走解释器）
   --jit-on-first-use         激进 JIT，首次调用立即编译
   -log                       生成结果文件夹并记录日志 (火焰图模式默认开启)
+  --log-level LEVEL          设置日志级别。
+                             可选值: verbose(v), debug(d), info(i), warning(w),
+                             error(e), fatal(f), silent(s)
   -v, --verbose              显示实际执行的完整命令
   -h, --help                 显示此帮助
 
@@ -35,6 +38,7 @@ FLAMEGRAPH_OUTPUT=""
 PERF_OUTPUT_ROOT="./local-perf-result"
 ENABLE_FLAMEGRAPH=0
 ENABLE_LOG=0
+LOG_LEVEL=""
 VERBOSE=0
 JIT_MODE="interpreter"
 PERF_MMAP_PAGES=1024
@@ -115,6 +119,14 @@ while [[ $# -gt 0 ]]; do
       ENABLE_LOG=1
       shift
       ;;
+    --log-level)
+      if [[ -z "${2:-}" ]]; then
+        echo "[错误] --log-level 需要参数" >&2
+        exit 1
+      fi
+      LOG_LEVEL="$2"
+      shift 2
+      ;;
     -v|--verbose)
       VERBOSE=1
       shift
@@ -148,6 +160,20 @@ export ICU_DATA_PATH="${ANDROID_I18N_ROOT}/etc/icu"
 export LD_LIBRARY_PATH="${AOSP_OUT_HOST}/lib64:${AOSP_OUT_HOST}/lib"
 export LD_USE_LOAD_BIAS=1
 export PATH="${AOSP_OUT_HOST}/bin:${PATH}"
+
+if [[ -n "${LOG_LEVEL:-}" ]]; then
+  case "${LOG_LEVEL}" in
+    verbose|v) l="v" ;;
+    debug|d)   l="d" ;;
+    info|i)    l="i" ;;
+    warning|w) l="w" ;;
+    error|e)   l="e" ;;
+    fatal|f)   l="f" ;;
+    silent|s)  l="s" ;;
+    *)         l="${LOG_LEVEL}" ;;
+  esac
+  export ANDROID_LOG_TAGS="*:${l}"
+fi
 
 mkdir -p "${ANDROID_DATA}"/dalvik-cache/x86_64
 
