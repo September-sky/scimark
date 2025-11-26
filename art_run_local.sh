@@ -16,6 +16,8 @@ usage() {
   --switch-interpreter       使用 switch-interpreter (等价 -Xint)
   --jit                      启用 JIT（默认关闭，走解释器）
   --jit-on-first-use         激进 JIT，首次调用立即编译
+  -log                       生成结果文件夹并记录日志 (火焰图模式默认开启)
+  -v, --verbose              显示实际执行的完整命令
   -h, --help                 显示此帮助
 
 SciMark 原生参数:
@@ -32,6 +34,8 @@ PERF_BIN="$(command -v perf 2>/dev/null)"
 FLAMEGRAPH_OUTPUT=""
 PERF_OUTPUT_ROOT="./local-perf-result"
 ENABLE_FLAMEGRAPH=0
+ENABLE_LOG=0
+VERBOSE=0
 JIT_MODE="interpreter"
 PERF_MMAP_PAGES=1024
 
@@ -105,6 +109,14 @@ while [[ $# -gt 0 ]]; do
         exit 1
       fi
       JIT_MODE="jit-first"
+      shift
+      ;;
+    -log)
+      ENABLE_LOG=1
+      shift
+      ;;
+    -v|--verbose)
+      VERBOSE=1
       shift
       ;;
     -h|--help)
@@ -192,7 +204,9 @@ if [[ ${ENABLE_FLAMEGRAPH} -eq 1 ]]; then
     echo "[错误] 未找到 FlameGraph 脚本，请确认目录 ${FLAMEGRAPH_ROOT}" >&2
     exit 1
   fi
+fi
 
+if [[ ${ENABLE_FLAMEGRAPH} -eq 1 || ${ENABLE_LOG} -eq 1 ]]; then
   mode_name="interpreter"
   case "${JIT_MODE}" in
     interpreter)
@@ -221,12 +235,15 @@ if [[ ${ENABLE_FLAMEGRAPH} -eq 1 ]]; then
   run_dir="${PERF_OUTPUT_ROOT}/${timestamp}-${mode_name}${arg_suffix}"
   mkdir -p "${run_dir}"
 
-  perf_data="${run_dir}/scimark-perf.data"
-  folded_txt="${run_dir}/scimark-perf.folded"
   log_file="${run_dir}/scimark-run.log"
 
   exec > >(tee -a "${log_file}") 2>&1
   echo "[信息] 日志输出: ${log_file}" >&2
+fi
+
+if [[ ${ENABLE_FLAMEGRAPH} -eq 1 ]]; then
+  perf_data="${run_dir}/scimark-perf.data"
+  folded_txt="${run_dir}/scimark-perf.folded"
 
   if [[ -z "${FLAMEGRAPH_OUTPUT}" ]]; then
     FLAMEGRAPH_OUTPUT="${run_dir}/scimark-perf.svg"
@@ -240,6 +257,9 @@ if [[ ${ENABLE_FLAMEGRAPH} -eq 1 ]]; then
     perf_record_cmd+=(--mmap-pages "${PERF_MMAP_PAGES}")
   fi
   perf_record_cmd+=(-- "${dalvik_cmd[@]}")
+  if [[ ${VERBOSE} -eq 1 ]]; then
+    echo "[执行命令] ${perf_record_cmd[*]}" >&2
+  fi
   "${perf_record_cmd[@]}"
 
   echo "[信息] 生成折叠栈文件 ${folded_txt}" >&2
@@ -250,5 +270,8 @@ if [[ ${ENABLE_FLAMEGRAPH} -eq 1 ]]; then
 
   echo "[完成] 火焰图已生成: ${FLAMEGRAPH_OUTPUT}" >&2
 else
+  if [[ ${VERBOSE} -eq 1 ]]; then
+    echo "[执行命令] ${dalvik_cmd[*]}" >&2
+  fi
   "${dalvik_cmd[@]}"
 fi
