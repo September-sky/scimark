@@ -263,8 +263,8 @@ if [[ ${ENABLE_FLAMEGRAPH} -eq 1 || ${ENABLE_LOG} -eq 1 ]]; then
 
   log_file="${run_dir}/scimark-run.log"
 
-  exec > >(tee -a "${log_file}") 2>&1
   echo "[信息] 日志输出: ${log_file}" >&2
+  exec > "${log_file}" 2>&1
 fi
 
 if [[ ${ENABLE_FLAMEGRAPH} -eq 1 ]]; then
