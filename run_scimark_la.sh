@@ -36,6 +36,8 @@ ENABLE_LOG=false
 LOG_LEVEL=""
 FLAMEGRAPH_OUTPUT=""
 SCIMARK_ARGS=()
+GDB_MODE=false
+GDB_ARGS=()
 
 # --- Helper Functions ---
 
@@ -58,6 +60,9 @@ Options:
   --perf-frequency <Hz>      Sampling frequency for profiling (default: 1000)
   --no-unwind                Disable stack unwinding in Simpleperf (faster)
   
+  --gdb                      Run under gdbserver64 (port :5039)
+  --gdb-arg <arg>            Pass option to dalvikvm (can be used multiple times)
+
   -o, --output <dir>         Local directory for results (default: ./results)
   -log                       Enable logging to file
   --log-level <level>        Log level (verbose, debug, info, etc.)
@@ -120,6 +125,15 @@ while [[ $# -gt 0 ]]; do
         --no-unwind)
             NO_UNWIND=true
             shift
+            ;;
+        --gdb)
+            GDB_MODE=true
+            ITERATIONS=1
+            shift
+            ;;
+        --gdb-arg)
+            GDB_ARGS+=("$2")
+            shift 2
             ;;
         -o|--output)
             DEFAULT_OUTPUT_DIR="$2"
@@ -218,8 +232,17 @@ case "$JIT_MODE" in
         ;;
 esac
 
+# GDB Setup
+GDB_PREFIX=""
+if [ "$GDB_MODE" = true ]; then
+    GDB_PREFIX="gdbserver64 --no-startup-with-shell 127.0.0.1:5039"
+    echo "GDB Enabled. Please run: adb forward tcp:5039 tcp:5039"
+    adb forward tcp:5039 tcp:5039
+fi
+
 # Base Dalvik Command
-DALVIK_CMD="/apex/com.android.art/bin/dalvikvm64 \
+DALVIK_CMD="$GDB_PREFIX /apex/com.android.art/bin/dalvikvm64 \
+    ${GDB_ARGS[*]} \
     -Xbootclasspath:$BCP \
     -Xbootclasspath-locations:$BCP \
     -Ximage:/apex/com.android.art/javalib/boot.art \
