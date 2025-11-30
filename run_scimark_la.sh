@@ -27,7 +27,7 @@ FLAMEGRAPH_DIR="${AOSP_ROOT}/tmp/Perf/FlameGraph"
 
 # Defaults
 ITERATIONS=1
-JIT_MODE="jit"
+JIT_MODE="interpreter"
 ENABLE_FLAMEGRAPH=false
 PERF_FREQUENCY=1000
 NO_UNWIND=false
@@ -48,8 +48,8 @@ Supports standard benchmarking and Simpleperf profiling.
 
 Options:
   -n, --iterations <N>       Number of iterations (default: 1)
-  --jit                      Enable JIT (default)
-  --interpreter              Force interpreter mode (-Xusejit:false)
+  --jit                      Disable JIT (default)
+  --interpreter              Force interpreter mode (-Xusejit:false) (default)
   --switch-interpreter       Use switch interpreter (-Xint)
   --jit-on-first-use         Aggressive JIT (-Xjitthreshold:0)
   
