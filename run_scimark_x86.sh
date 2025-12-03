@@ -16,6 +16,7 @@ usage() {
   --switch-interpreter       使用 switch-interpreter (等价 -Xint)
   --jit                      启用 JIT（默认关闭，走解释器）
   --jit-on-first-use         激进 JIT，首次调用立即编译
+  --debuggable               启用 debuggable 模式（编译器 --debuggable + 运行时 -Xopaque-jni-ids:true）
   -log                       生成结果文件夹并记录日志 (火焰图模式默认开启)
   --log-level LEVEL          设置日志级别。
                              可选值: verbose(v), debug(d), info(i), warning(w),
@@ -42,6 +43,7 @@ LOG_LEVEL=""
 VERBOSE=0
 JIT_MODE="interpreter"
 PERF_MMAP_PAGES=1024
+DEBUGGABLE=0
 
 SCIMARK_ARGS=()
 
@@ -113,6 +115,10 @@ while [[ $# -gt 0 ]]; do
         exit 1
       fi
       JIT_MODE="jit-first"
+      shift
+      ;;
+    --debuggable)
+      DEBUGGABLE=1
       shift
       ;;
     -log)
@@ -203,6 +209,12 @@ if [[ ${#jit_flags[@]} -gt 0 ]]; then
   dalvik_cmd+=("${jit_flags[@]}")
 fi
 
+if [[ ${DEBUGGABLE} -eq 1 ]]; then
+  # -Xcompiler-option --debuggable 传给 dex2oat 编译器
+  # -Xopaque-jni-ids:true 传给运行时（启用不透明 JNI ID）
+  dalvik_cmd+=("-Xcompiler-option" "--debuggable" "-Xopaque-jni-ids:true")
+fi
+
 dalvik_cmd+=(
   -cp
   scimark-dex.jar
@@ -248,6 +260,10 @@ if [[ ${ENABLE_FLAMEGRAPH} -eq 1 || ${ENABLE_LOG} -eq 1 ]]; then
       mode_name="jit-on-first-use"
       ;;
   esac
+
+  if [[ ${DEBUGGABLE} -eq 1 ]]; then
+    mode_name="${mode_name}-debuggable"
+  fi
 
   arg_suffix=""
   if [[ ${#SCIMARK_ARGS[@]} -gt 0 ]]; then
