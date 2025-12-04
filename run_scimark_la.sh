@@ -31,6 +31,8 @@ JIT_MODE="interpreter"
 ENABLE_FLAMEGRAPH=false
 PERF_FREQUENCY=1000
 NO_UNWIND=false
+POST_UNWIND=false
+KEEP_FAILED_UNWIND=false
 VERBOSE=false
 ENABLE_LOG=false
 LOG_LEVEL=""
@@ -58,7 +60,10 @@ Options:
   --flamegraph               Enable Simpleperf profiling and generate FlameGraph
   --flamegraph-output <path> Path to save the SVG flamegraph
   --perf-frequency <Hz>      Sampling frequency for profiling (default: 1000)
-  --no-unwind                Disable stack unwinding in Simpleperf (faster)
+  --fp                       Use frame pointer unwinding (recommended for chroot/interpreter)
+  --no-unwind                Disable stack unwinding in Simpleperf (faster, but flame graph will be flat)
+  --post-unwind              Unwind call stacks after recording (may improve success rate)
+  --keep-failed-unwind       Keep failed unwinding debug info for diagnosis
   
   --gdb                      Run under gdbserver64 (port :5039)
   --gdb-arg <arg>            Pass option to dalvikvm (can be used multiple times)
@@ -122,8 +127,20 @@ while [[ $# -gt 0 ]]; do
             PERF_FREQUENCY="$2"
             shift 2
             ;;
+        --fp)
+            USE_FP=true
+            shift
+            ;;
         --no-unwind)
             NO_UNWIND=true
+            shift
+            ;;
+        --post-unwind)
+            POST_UNWIND=true
+            shift
+            ;;
+        --keep-failed-unwind)
+            KEEP_FAILED_UNWIND=true
             shift
             ;;
         --gdb)
@@ -265,43 +282,383 @@ for i in $(seq 1 $ITERATIONS); do
     if [ "$ENABLE_FLAMEGRAPH" = true ]; then
         # Profiling Mode
         PERF_DATA_DEVICE="$DEVICE_TMP/perf.data"
-        UNWIND_FLAG=""
-        if [ "$NO_UNWIND" = true ]; then UNWIND_FLAG="--no-unwind"; fi
         
-        log "Running with Simpleperf..."
+        if [ "$USE_FP" = true ]; then
+            CALL_GRAPH_OPTION="--call-graph fp"
+        else
+            CALL_GRAPH_OPTION="--call-graph dwarf"
+        fi
+
+        EXTRA_PERF_OPTIONS=""
         
-        # Run simpleperf on device
-        adb shell "chroot $DEVICE_CHROOT /system/bin/simpleperf record \
-            -g -f $PERF_FREQUENCY $UNWIND_FLAG -o $PERF_DATA_DEVICE \
-            $DALVIK_CMD"
+        if [ "$NO_UNWIND" = true ]; then
+            log "WARNING: --no-unwind will disable call stack unwinding."
+            log "         Flame graph will only show flat profile without call chains."
+            log "         Remove --no-unwind to see full call stacks."
+            CALL_GRAPH_OPTION="--no-unwind"
+        fi
+        
+        if [ "$POST_UNWIND" = true ]; then
+            log "Using post-unwind mode (unwinding after recording)..."
+            EXTRA_PERF_OPTIONS="$EXTRA_PERF_OPTIONS --post-unwind=yes"
+        fi
+        
+        if [ "$KEEP_FAILED_UNWIND" = true ]; then
+            log "Keeping failed unwinding debug info..."
+            EXTRA_PERF_OPTIONS="$EXTRA_PERF_OPTIONS --keep-failed-unwinding-result --keep-failed-unwinding-debug-info"
+        fi
+        
+        if [ "$NO_UNWIND" = true ]; then
+            CG_MODE="disabled"
+        elif [ "$USE_FP" = true ]; then
+            CG_MODE="fp"
+        else
+            CG_MODE="dwarf"
+        fi
+        log "Running with Simpleperf (call-graph: $CG_MODE)..."
+    
+        
+        # Run simpleperf on device (using system simpleperf outside chroot)
+        # --call-graph dwarf: Use DWARF debug info for stack unwinding (more reliable than frame pointer)
+        adb shell "/system/bin/simpleperf record \
+            $CALL_GRAPH_OPTION $EXTRA_PERF_OPTIONS -f $PERF_FREQUENCY -o $DEVICE_CHROOT$PERF_DATA_DEVICE \
+            chroot $DEVICE_CHROOT $DALVIK_CMD"
             
         log "Pulling perf data..."
         adb pull "$DEVICE_CHROOT$PERF_DATA_DEVICE" "$OUTPUT_DIR/perf.data"
         
+        # Pull JIT profile maps (perf-*.map)
+        # ART usually writes these to /data/local/tmp or /tmp
+        # Since we are in chroot, check chroot's tmp locations
+        log "Pulling JIT maps..."
+        # Try to find map files in common locations
+        MAP_FILES=$(adb shell "find $DEVICE_CHROOT/data/local/tmp $DEVICE_CHROOT/tmp -name 'perf-*.map' 2>/dev/null")
+        if [ -n "$MAP_FILES" ]; then
+            for map_file in $MAP_FILES; do
+                log "Pulling map file: $map_file"
+                adb pull "$map_file" "$OUTPUT_DIR/"
+            done
+        else
+            log "Warning: No perf-*.map files found. JIT symbols might be missing."
+        fi
+
         # Generate Reports
         log "Generating text reports..."
-        adb shell "chroot $DEVICE_CHROOT /system/bin/simpleperf report -i $PERF_DATA_DEVICE --sort symbol --percent-limit 0.01" > "$OUTPUT_DIR/report_symbol.txt"
-        adb shell "chroot $DEVICE_CHROOT /system/bin/simpleperf report -i $PERF_DATA_DEVICE -g --percent-limit 0.01" > "$OUTPUT_DIR/report_callgraph.txt"
+        adb shell "/system/bin/simpleperf report -i $DEVICE_CHROOT$PERF_DATA_DEVICE --sort symbol --percent-limit 0.01" > "$OUTPUT_DIR/report_symbol.txt"
+        adb shell "/system/bin/simpleperf report -i $DEVICE_CHROOT$PERF_DATA_DEVICE -g --percent-limit 0.01" > "$OUTPUT_DIR/report_callgraph.txt"
         
         # FlameGraph generation
         SIMPLEPERF_SCRIPTS_DIR="${AOSP_ROOT}/system/extras/simpleperf/scripts"
-        REPORT_SAMPLE_SCRIPT="${SIMPLEPERF_SCRIPTS_DIR}/report_sample.py"
-        STACKCOLLAPSE_SCRIPT="${FLAMEGRAPH_DIR}/stackcollapse-perf.pl"
+        STACKCOLLAPSE_PY="${SIMPLEPERF_SCRIPTS_DIR}/stackcollapse.py"
+        BINARY_CACHE_BUILDER="${SIMPLEPERF_SCRIPTS_DIR}/binary_cache_builder.py"
         FLAMEGRAPH_SCRIPT="${FLAMEGRAPH_DIR}/flamegraph.pl"
 
-        if [ -f "$FLAMEGRAPH_SCRIPT" ] && [ -f "$STACKCOLLAPSE_SCRIPT" ]; then
+        if [ -f "$FLAMEGRAPH_SCRIPT" ] && [ -f "$STACKCOLLAPSE_PY" ]; then
              log "Generating FlameGraph..."
              
+             # Set PYTHONPATH to find simpleperf dependencies
+             export PYTHONPATH="$SIMPLEPERF_SCRIPTS_DIR:$PYTHONPATH"
+             
+             # 0. Build binary_cache (Pull symbols from device)
+             if [ -f "$BINARY_CACHE_BUILDER" ]; then
+                 log "Building binary_cache (pulling symbols)..."
+                 
+                 # Try to find local symbols
+                 LOCAL_LIB_ARGS=()
+                 # Detect product output directory (assuming only one product or taking the first one)
+                 PRODUCT_OUT_DIRS=("$AOSP_ROOT/out/target/product/"*)
+                 if [ ${#PRODUCT_OUT_DIRS[@]} -gt 0 ] && [ -d "${PRODUCT_OUT_DIRS[0]}" ]; then
+                     PRODUCT_OUT="${PRODUCT_OUT_DIRS[0]}"
+                     SYMBOLS_DIR="$PRODUCT_OUT/symbols"
+                     OBJ_LIB_DIR="$PRODUCT_OUT/obj/SHARED_LIBRARIES"
+                     
+                     if [ -d "$SYMBOLS_DIR" ]; then
+                         log "Found local symbols dir: $SYMBOLS_DIR"
+                         LOCAL_LIB_ARGS+=("-lib" "$SYMBOLS_DIR")
+                     fi
+                     if [ -d "$OBJ_LIB_DIR" ]; then
+                         log "Found local obj libs dir: $OBJ_LIB_DIR"
+                         LOCAL_LIB_ARGS+=("-lib" "$OBJ_LIB_DIR")
+                     fi
+                 fi
+
+                 # binary_cache_builder.py in AOSP doesn't support -o, it uses binary_cache in current dir by default
+                 # We need to cd to OUTPUT_DIR to make it work cleanly
+                 
+                 pushd "$OUTPUT_DIR" > /dev/null
+                 python3 "$BINARY_CACHE_BUILDER" -i "perf.data" "${LOCAL_LIB_ARGS[@]}" >/dev/null 2>&1
+                 popd > /dev/null
+
+                 # Force overwrite with local symbols (User Request)
+                 if [ -n "$SYMBOLS_DIR" ] || [ -n "$OBJ_LIB_DIR" ]; then
+                     log "Forcing local symbols for ART libraries..."
+                     for lib_name in "libart.so" "libartd.so" "dalvikvm64" "libc.so"; do
+                         # Find local file (Prefer unstripped)
+                         LOCAL_FILE=""
+                         
+                         # Helper function to find unstripped file in a directory
+                         find_unstripped() {
+                             local dir="$1"
+                             local name="$2"
+                             if [ -d "$dir" ]; then
+                                 find "$dir" -name "$name" | while read -r cand; do
+                                     if file "$cand" | grep -q "not stripped"; then
+                                         echo "$cand"
+                                         break
+                                     fi
+                                 done
+                             fi
+                         }
+                         
+                         # Try SYMBOLS_DIR first
+                         if [ -n "$SYMBOLS_DIR" ]; then
+                             LOCAL_FILE=$(find_unstripped "$SYMBOLS_DIR" "$lib_name" | head -n 1)
+                         fi
+                         
+                         # Try OBJ_LIB_DIR if not found
+                         if [ -z "$LOCAL_FILE" ] && [ -n "$OBJ_LIB_DIR" ]; then
+                             LOCAL_FILE=$(find_unstripped "$OBJ_LIB_DIR" "$lib_name" | head -n 1)
+                         fi
+                         
+                         if [ -f "$LOCAL_FILE" ]; then
+                             log "Found local unstripped $lib_name: $LOCAL_FILE"
+                             # Find in binary_cache
+                             CACHE_FILES=$(find "$OUTPUT_DIR/binary_cache" -name "$lib_name")
+                             if [ -n "$CACHE_FILES" ]; then
+                                 for cache_file in $CACHE_FILES; do
+                                     log "Overwriting cache file: $cache_file"
+                                     cp -f "$LOCAL_FILE" "$cache_file"
+                                 done
+                             else
+                                 log "Warning: $lib_name not found in binary_cache, cannot overwrite."
+                             fi
+                         else
+                             log "Warning: Could not find local unstripped $lib_name"
+                         fi
+                     done
+                 fi
+                 
+                 # Copy JIT maps to binary_cache if they exist
+                 if ls "$OUTPUT_DIR"/perf-*.map 1> /dev/null 2>&1; then
+                     mkdir -p "$OUTPUT_DIR/binary_cache"
+                     cp "$OUTPUT_DIR"/perf-*.map "$OUTPUT_DIR/binary_cache/"
+                 fi
+                 
+                 # Use binary_cache for stackcollapse
+                 SYMBOLS_DIR="$OUTPUT_DIR/binary_cache"
+             else
+                 log "Warning: binary_cache_builder.py not found. Symbols might be missing."
+                 SYMBOLS_DIR="$OUTPUT_DIR"
+             fi
+             
+             # 1. Create proper symfs directory structure for report_sample.py
+             # binary_cache uses build-id directories, but report_sample.py expects path-based structure
+             log "Creating symfs directory with proper paths..."
+             SYMFS_DIR="$OUTPUT_DIR/symfs"
+             mkdir -p "$SYMFS_DIR"
+             
+             # Method 1: Copy apex, system, data directories from binary_cache if they exist
+             for dir in apex system data; do
+                 if [ -d "$OUTPUT_DIR/binary_cache/$dir" ]; then
+                     log "Copying $dir directory to symfs..."
+                     cp -rL "$OUTPUT_DIR/binary_cache/$dir" "$SYMFS_DIR/" 2>/dev/null || true
+                 fi
+             done
+             
+             # Method 2: For build-id based files, simpleperf report can use them directly
+             # We'll use a different approach - use simpleperf report with proper symbol paths
+             # Instead of relying on symfs, we'll use the device's simpleperf report which has symbols
+             
+             # Alternative: If symfs is still empty, create manual links for known libraries
+             if [ ! -d "$SYMFS_DIR/apex" ]; then
+                 log "Creating manual symfs structure from binary_cache..."
+                 
+                 # Create standard Android paths and link files
+                 mkdir -p "$SYMFS_DIR/apex/com.android.art/lib64"
+                 mkdir -p "$SYMFS_DIR/system/lib64"
+                 mkdir -p "$SYMFS_DIR/system/bin"
+                 
+                 # Link libartd.so (use absolute paths)
+                 artd_file="$OUTPUT_DIR/binary_cache/7d1434719005f63c6a0d5ef1b3a4ae5d00000000/libartd.so"
+                 if [ -f "$artd_file" ]; then
+                     ln -sf "$(cd "$(dirname "$artd_file")" && pwd)/$(basename "$artd_file")" \
+                            "$SYMFS_DIR/apex/com.android.art/lib64/libartd.so"
+                     log "Linked libartd.so"
+                 fi
+                 
+                 # Link libc.so (use absolute paths)
+                 libc_file="$OUTPUT_DIR/binary_cache/a313b85c01ef6d63309869fa1ec9bfed00000000/libc.so"
+                 if [ -f "$libc_file" ]; then
+                     ln -sf "$(cd "$(dirname "$libc_file")" && pwd)/$(basename "$libc_file")" \
+                            "$SYMFS_DIR/system/lib64/libc.so"
+                     log "Linked libc.so"
+                 fi
+                 
+                 # Link other common libraries based on build_id_list
+                 if [ -f "$OUTPUT_DIR/binary_cache/build_id_list" ]; then
+                     while IFS= read -r line; do
+                         # Format: 0xBUILD_ID=relative_path (e.g., 0x7d14...=7d14.../libartd.so)
+                         if [[ "$line" =~ 0x([0-9a-f]+)=([^/]+)/([^/]+)$ ]]; then
+                             build_id="${BASH_REMATCH[1]}"
+                             build_id_dir="${BASH_REMATCH[2]}"
+                             filename="${BASH_REMATCH[3]}"
+                             
+                             actual_file="$OUTPUT_DIR/binary_cache/$build_id_dir/$filename"
+                             
+                             if [ -f "$actual_file" ]; then
+                                 # Determine target path based on filename
+                                 case "$filename" in
+                                     libartd.so|libart.so|libdexfiled.so|libartbased.so)
+                                         target="$SYMFS_DIR/apex/com.android.art/lib64/$filename"
+                                         ;;
+                                     dalvikvm64)
+                                         target="$SYMFS_DIR/apex/com.android.art/bin/$filename"
+                                         mkdir -p "$SYMFS_DIR/apex/com.android.art/bin"
+                                         ;;
+                                     libc.so|libm.so|libdl.so)
+                                         target="$SYMFS_DIR/system/lib64/$filename"
+                                         ;;
+                                     linker64)
+                                         target="$SYMFS_DIR/system/bin/$filename"
+                                         ;;
+                                     *)
+                                         target="$SYMFS_DIR/system/lib64/$filename"
+                                         ;;
+                                 esac
+                                 
+                                 if [ ! -e "$target" ]; then
+                                     # Use absolute path for symlink
+                                     abs_path="$(cd "$(dirname "$actual_file")" && pwd)/$(basename "$actual_file")"
+                                     ln -sf "$abs_path" "$target"
+                                 fi
+                             fi
+                         fi
+                     done < "$OUTPUT_DIR/binary_cache/build_id_list"
+                 fi
+             fi
+             
+             # 2. Generate perf script format using report_sample.py with proper symfs
+             REPORT_SAMPLE_SCRIPT="${SIMPLEPERF_SCRIPTS_DIR}/report_sample.py"
+             
              if [ -f "$REPORT_SAMPLE_SCRIPT" ]; then
-                 # 1. Generate perf script format using report_sample.py
-                 # Set PYTHONPATH to find simpleperf dependencies
-                 export PYTHONPATH="$SIMPLEPERF_SCRIPTS_DIR:$PYTHONPATH"
-                 python3 "$REPORT_SAMPLE_SCRIPT" -i "$OUTPUT_DIR/perf.data" > "$OUTPUT_DIR/out.perf" 2>/dev/null
+                 log "Generating perf script output with symbols..."
                  
-                 # 2. Fold stacks
-                 "$STACKCOLLAPSE_SCRIPT" "$OUTPUT_DIR/out.perf" > "$OUTPUT_DIR/out.folded"
+                 # Use binary_cache directly as symfs - simpleperf knows how to handle build-id directories
+                 # Also provide the manually created symfs as a fallback
+                 python3 "$REPORT_SAMPLE_SCRIPT" \
+                    -i "$OUTPUT_DIR/perf.data" \
+                    --symfs "$OUTPUT_DIR/binary_cache" \
+                    > "$OUTPUT_DIR/out.perf" 2>/dev/null
                  
-                 # 3. Generate SVG
+                 # Check if symbols were resolved
+                 UNRESOLVED_COUNT=$(grep -c '\[+[0-9a-f]\+\]' "$OUTPUT_DIR/out.perf" 2>/dev/null || echo 0)
+                 RESOLVED_COUNT=$(grep -cE 'art::|nterp_|_Z[0-9]+' "$OUTPUT_DIR/out.perf" 2>/dev/null || echo 0)
+                 
+                 log "Symbol resolution: $RESOLVED_COUNT resolved, $UNRESOLVED_COUNT unresolved"
+                 
+                 # If many symbols are still unresolved, try with the manual symfs structure
+                 if [ "$UNRESOLVED_COUNT" -gt 1000 ] && [ -d "$SYMFS_DIR/apex" ]; then
+                     log "Trying alternative symfs structure..."
+                     python3 "$REPORT_SAMPLE_SCRIPT" \
+                        -i "$OUTPUT_DIR/perf.data" \
+                        --symfs "$SYMFS_DIR" \
+                        > "$OUTPUT_DIR/out.perf.alt" 2>/dev/null
+                     
+                     ALT_UNRESOLVED=$(grep -c '\[+[0-9a-f]\+\]' "$OUTPUT_DIR/out.perf.alt" 2>/dev/null || echo 0)
+                     if [ "$ALT_UNRESOLVED" -lt "$UNRESOLVED_COUNT" ]; then
+                         log "Alternative symfs produced better results, using it"
+                         mv "$OUTPUT_DIR/out.perf.alt" "$OUTPUT_DIR/out.perf"
+                     else
+                         rm -f "$OUTPUT_DIR/out.perf.alt"
+                     fi
+                 fi
+                 
+                 # 3. Fold stacks using Brendan Gregg's stackcollapse-perf.pl
+                 log "Folding stacks..."
+                 "$FLAMEGRAPH_DIR/stackcollapse-perf.pl" "$OUTPUT_DIR/out.perf" > "$OUTPUT_DIR/out.folded.raw"
+                 
+                 # 4. Post-process to resolve remaining unresolved symbols using addr2line
+                 log "Post-processing unresolved symbols..."
+                 python3 - <<'PYEOF' "$OUTPUT_DIR/out.folded.raw" "$OUTPUT_DIR/out.folded" "$OUTPUT_DIR/binary_cache"
+import sys
+import re
+import subprocess
+from pathlib import Path
+
+input_file = sys.argv[1]
+output_file = sys.argv[2]
+binary_cache = sys.argv[3]
+
+# Find libartd.so in binary_cache
+libartd_path = None
+for p in Path(binary_cache).rglob("libartd.so"):
+    libartd_path = str(p)
+    break
+
+if not libartd_path:
+    # No libartd.so found, just copy the file
+    with open(input_file, 'r') as f_in, open(output_file, 'w') as f_out:
+        f_out.write(f_in.read())
+    sys.exit(0)
+
+# Cache for addr2line results
+addr_cache = {}
+
+def resolve_address(addr_hex):
+    if addr_hex in addr_cache:
+        return addr_cache[addr_hex]
+    
+    try:
+        # Use addr2line to get function name
+        result = subprocess.run(
+            ['addr2line', '-e', libartd_path, '-f', '-C', addr_hex],
+            capture_output=True, text=True, timeout=1
+        )
+        lines = result.stdout.strip().split('\n')
+        if len(lines) >= 1 and lines[0] != '??':
+            func_name = lines[0]
+            # Clean up function name
+            func_name = re.sub(r'\s*\[clone.*?\]$', '', func_name)
+            addr_cache[addr_hex] = func_name
+            return func_name
+    except:
+        pass
+    
+    addr_cache[addr_hex] = None
+    return None
+
+# Process folded stacks
+with open(input_file, 'r') as f_in, open(output_file, 'w') as f_out:
+    for line in f_in:
+        line = line.rstrip()
+        if not line:
+            continue
+        
+        # Check if line contains unresolved libartd.so symbols
+        if 'libartd.so[+' in line:
+            # Extract all unresolved addresses
+            def replace_unresolved(match):
+                addr = match.group(1)
+                resolved = resolve_address(addr)
+                if resolved:
+                    return resolved
+                return match.group(0)  # Keep original if resolution fails
+            
+            line = re.sub(r'libartd\.so\[\+([0-9a-f]+)\]', replace_unresolved, line)
+        
+        f_out.write(line + '\n')
+PYEOF
+                 
+                 # Check resolution improvement
+                 RAW_UNRESOLVED=$(grep -c 'libartd\.so\[+' "$OUTPUT_DIR/out.folded.raw" 2>/dev/null || echo 0)
+                 FINAL_UNRESOLVED=$(grep -c 'libartd\.so\[+' "$OUTPUT_DIR/out.folded" 2>/dev/null || echo 0)
+                 RESOLVED_COUNT=$((RAW_UNRESOLVED - FINAL_UNRESOLVED))
+                 
+                 if [ "$RESOLVED_COUNT" -gt 0 ]; then
+                     log "addr2line resolved $RESOLVED_COUNT additional symbols"
+                 fi
+                 
+                 # 4. Generate SVG
                  FINAL_SVG="$OUTPUT_DIR/flamegraph.svg"
                  if [ -n "$FLAMEGRAPH_OUTPUT" ]; then
                      FINAL_SVG="$FLAMEGRAPH_OUTPUT"
@@ -316,10 +673,12 @@ for i in $(seq 1 $ITERATIONS); do
                     
                  log "FlameGraph saved to: $FINAL_SVG"
              else
-                 log "Warning: report_sample.py not found at $REPORT_SAMPLE_SCRIPT. Skipping FlameGraph."
+                 log "Error: report_sample.py not found."
              fi
         else
-             log "Warning: FlameGraph tools (flamegraph.pl/stackcollapse-perf.pl) not found at $FLAMEGRAPH_DIR"
+             log "Warning: FlameGraph tools not found."
+             if [ ! -f "$STACKCOLLAPSE_PY" ]; then log "  Missing: $STACKCOLLAPSE_PY"; fi
+             if [ ! -f "$FLAMEGRAPH_SCRIPT" ]; then log "  Missing: $FLAMEGRAPH_SCRIPT (Please clone https://github.com/brendangregg/FlameGraph to $FLAMEGRAPH_DIR)"; fi
         fi
         
     else
