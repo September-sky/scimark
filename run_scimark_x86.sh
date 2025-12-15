@@ -12,6 +12,7 @@ usage() {
   --perf-frequency N         perf 采样频率 (默认 99 Hz)
   --perf-bin PATH            指定 perf 可执行文件
   --perf-mmap-pages N        perf 缓冲区页数 (默认 1024，0 表示不设置)
+  --call-graph MODE          perf 调用栈回溯模式: fp (快) 或 dwarf (默认，慢, 详细)
   --interpreter              强制解释模式 (默认)
   --switch-interpreter       使用 switch-interpreter (等价 -Xint)
   --jit                      启用 JIT（默认关闭，走解释器）
@@ -43,6 +44,7 @@ LOG_LEVEL=""
 VERBOSE=0
 JIT_MODE="interpreter"
 PERF_MMAP_PAGES=1024
+PERF_CALL_GRAPH="dwarf"
 DEBUGGABLE=0
 
 SCIMARK_ARGS=()
@@ -87,6 +89,18 @@ while [[ $# -gt 0 ]]; do
         exit 1
       fi
       PERF_MMAP_PAGES="$2"
+      shift 2
+      ;;
+    --call-graph)
+      if [[ -z "${2:-}" ]]; then
+        echo "[错误] --call-graph 需要参数 (fp 或 dwarf)" >&2
+        exit 1
+      fi
+      if [[ "$2" != "fp" && "$2" != "dwarf" ]]; then
+        echo "[错误] --call-graph 只能是 fp 或 dwarf" >&2
+        exit 1
+      fi
+      PERF_CALL_GRAPH="$2"
       shift 2
       ;;
     --interpreter)
@@ -294,7 +308,8 @@ if [[ ${ENABLE_FLAMEGRAPH} -eq 1 ]]; then
   fi
 
   echo "[信息] 使用 perf 采样，输出 ${perf_data}" >&2
-  perf_record_cmd=("${PERF_BIN}" record --call-graph dwarf -F "${PERF_FREQ}" -o "${perf_data}")
+  # 使用用户指定的 call-graph 模式 (默认 fp)
+  perf_record_cmd=("${PERF_BIN}" record --call-graph "${PERF_CALL_GRAPH}" -F "${PERF_FREQ}" -o "${perf_data}")
   if [[ -n "${PERF_MMAP_PAGES}" && "${PERF_MMAP_PAGES}" != "0" ]]; then
     perf_record_cmd+=(--mmap-pages "${PERF_MMAP_PAGES}")
   fi
@@ -309,10 +324,24 @@ if [[ ${ENABLE_FLAMEGRAPH} -eq 1 ]]; then
   echo "[耗时] perf record: $((end_t - start_t)) 秒" >&2
 
   echo "[信息] 生成折叠栈文件 ${folded_txt}" >&2
+  
+  # 拆分步骤 1: perf script 解码 (通常是瓶颈)
+  unfolded_txt="${run_dir}/scimark-perf.unfolded"
+  echo "[步骤 1/2] 执行 perf script 解码 (DWARF Unwinding)..." >&2
   start_t=$(date +%s)
-  "${PERF_BIN}" script -i "${perf_data}" | perl "${STACK_COLLAPSE}" > "${folded_txt}"
+  "${PERF_BIN}" script -i "${perf_data}" > "${unfolded_txt}"
   end_t=$(date +%s)
-  echo "[耗时] perf script + stackcollapse: $((end_t - start_t)) 秒" >&2
+  echo "[耗时] perf script decoding: $((end_t - start_t)) 秒" >&2
+
+  # 拆分步骤 2: stackcollapse 折叠
+  echo "[步骤 2/2] 执行 stackcollapse 折叠..." >&2
+  start_t=$(date +%s)
+  perl "${STACK_COLLAPSE}" "${unfolded_txt}" > "${folded_txt}"
+  end_t=$(date +%s)
+  echo "[耗时] stackcollapse processing: $((end_t - start_t)) 秒" >&2
+  
+  # 可选：清理巨大的中间文件
+  # rm "${unfolded_txt}"
 
   echo "[信息] 生成火焰图 ${FLAMEGRAPH_OUTPUT}" >&2
   start_t=$(date +%s)
