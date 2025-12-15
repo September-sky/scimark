@@ -9,7 +9,7 @@ usage() {
 脚本选项:
   --flamegraph               使用 perf+FlameGraph 生成火焰图
   --flamegraph-output PATH   指定 SVG 输出路径 (默认: ./local-perf-result/<时间戳>-<模式...>/scimark-perf.svg)
-  --perf-frequency N         perf 采样频率 (默认 1000 Hz)
+  --perf-frequency N         perf 采样频率 (默认 99 Hz)
   --perf-bin PATH            指定 perf 可执行文件
   --perf-mmap-pages N        perf 缓冲区页数 (默认 1024，0 表示不设置)
   --interpreter              强制解释模式 (默认)
@@ -33,7 +33,7 @@ EOF
 AOSP="/home/yanxi/loongson/aosp15.la"
 AOSP_OUT_HOST="$AOSP/out/host/linux-x86"
 FLAMEGRAPH_ROOT="/home/yanxi/loongson/aosp15.la/tmp/Perf/FlameGraph"
-PERF_FREQ=1000
+PERF_FREQ=99
 PERF_BIN="$(command -v perf 2>/dev/null)"
 FLAMEGRAPH_OUTPUT=""
 PERF_OUTPUT_ROOT="./local-perf-result"
@@ -302,13 +302,23 @@ if [[ ${ENABLE_FLAMEGRAPH} -eq 1 ]]; then
   if [[ ${VERBOSE} -eq 1 ]]; then
     echo "[执行命令] ${perf_record_cmd[*]}" >&2
   fi
+  
+  start_t=$(date +%s)
   "${perf_record_cmd[@]}"
+  end_t=$(date +%s)
+  echo "[耗时] perf record: $((end_t - start_t)) 秒" >&2
 
   echo "[信息] 生成折叠栈文件 ${folded_txt}" >&2
+  start_t=$(date +%s)
   "${PERF_BIN}" script -i "${perf_data}" | perl "${STACK_COLLAPSE}" > "${folded_txt}"
+  end_t=$(date +%s)
+  echo "[耗时] perf script + stackcollapse: $((end_t - start_t)) 秒" >&2
 
   echo "[信息] 生成火焰图 ${FLAMEGRAPH_OUTPUT}" >&2
+  start_t=$(date +%s)
   perl "${FLAMEGRAPH_PL}" "${folded_txt}" > "${FLAMEGRAPH_OUTPUT}"
+  end_t=$(date +%s)
+  echo "[耗时] flamegraph generation: $((end_t - start_t)) 秒" >&2
 
   echo "[完成] 火焰图已生成: ${FLAMEGRAPH_OUTPUT}" >&2
 else
