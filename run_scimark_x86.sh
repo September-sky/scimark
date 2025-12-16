@@ -18,7 +18,7 @@ usage() {
   --jit                      启用 JIT（默认关闭，走解释器）
   --jit-on-first-use         激进 JIT，首次调用立即编译
   --debuggable               启用 debuggable 模式（编译器 --debuggable + 运行时 -Xopaque-jni-ids:true）
-  -log                       生成结果文件夹并记录日志 (火焰图模式默认开启)
+  --log                       生成结果文件夹并记录日志 (火焰图模式默认开启)
   --log-level LEVEL          设置日志级别。
                              可选值: verbose(v), debug(d), info(i), warning(w),
                              error(e), fatal(f), silent(s)
@@ -135,7 +135,7 @@ while [[ $# -gt 0 ]]; do
       DEBUGGABLE=1
       shift
       ;;
-    -log)
+    --log)
       ENABLE_LOG=1
       shift
       ;;
