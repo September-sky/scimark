@@ -52,7 +52,7 @@ Supports standard benchmarking and Simpleperf profiling.
 
 Options:
   -n, --iterations <N>       Number of iterations (default: 1)
-  --jit                      Disable JIT (default)
+  --jit                      Enable JIT
   --interpreter              Force interpreter mode (-Xusejit:false) (default)
   --switch-interpreter       Use switch interpreter (-Xint)
   --jit-on-first-use         Aggressive JIT (-Xjitthreshold:0)
@@ -69,7 +69,7 @@ Options:
   --gdb-arg <arg>            Pass option to dalvikvm (can be used multiple times)
 
   -o, --output <dir>         Local directory for results (default: ./results)
-  -log                       Enable logging to file
+  --log                       Enable logging to file
   --log-level <level>        Log level (verbose, debug, info, etc.)
   -v, --verbose              Show verbose output
   -h, --help                 Show this help
@@ -156,7 +156,7 @@ while [[ $# -gt 0 ]]; do
             DEFAULT_OUTPUT_DIR="$2"
             shift 2
             ;;
-        -log)
+        --log)
             ENABLE_LOG=true
             shift
             ;;
@@ -317,6 +317,8 @@ for i in $(seq 1 $ITERATIONS); do
         fi
         log "Running with Simpleperf (call-graph: $CG_MODE)..."
     
+        # Clear logcat buffer to capture fresh crash logs
+        adb logcat -c
         
         # Run simpleperf on device (using system simpleperf outside chroot)
         # --call-graph dwarf: Use DWARF debug info for stack unwinding (more reliable than frame pointer)
