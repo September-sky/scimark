@@ -53,6 +53,7 @@ Supports standard benchmarking and Simpleperf profiling.
 Options:
   -n, --iterations <N>       Number of iterations (default: 1)
   --jit                      Enable JIT
+  --jit-baseline             Enable JIT with baseline compiler (optimization level 0)
   --interpreter              Force interpreter mode (-Xusejit:false) (default)
   --switch-interpreter       Use switch interpreter (-Xint)
   --jit-on-first-use         Aggressive JIT (-Xjitthreshold:0)
@@ -100,6 +101,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --jit)
             JIT_MODE="jit"
+            shift
+            ;;
+        --jit-baseline)
+            JIT_MODE="jit-baseline"
             shift
             ;;
         --interpreter)
@@ -244,6 +249,9 @@ case "$JIT_MODE" in
     jit)
         JIT_FLAGS="-Xusejit:true"
         ;;
+    jit-baseline)
+        JIT_FLAGS="-Xusejit:true -Xcompiler-option --baseline -Xcompiler-option --baseline-optimization-level=0"
+        ;;
     jit-first)
         JIT_FLAGS="-Xusejit:true -Xjitthreshold:0"
         ;;
@@ -264,6 +272,10 @@ DALVIK_CMD="$GDB_PREFIX /apex/com.android.art/bin/dalvikvm64 \
     -Xbootclasspath-locations:$BCP \
     -Ximage:/apex/com.android.art/javalib/boot.art \
     $JIT_FLAGS \
+    -Xcompiler-option --dump-cfg=$DEVICE_TMP/cfg.txt \
+    -Xcompiler-option --dump-cfg-append \
+    -Xcompiler-option --disassemble \
+    -Xcompiler-option --verbose-methods=scimark2.Random.nextDouble \
     -Xmx256m \
     -cp $DEVICE_TMP/scimark-dex.jar \
     jnt.scimark2.commandline \
