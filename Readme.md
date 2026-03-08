@@ -101,3 +101,112 @@
 ### 💡 核心结论
 *   能用 **`--fp`** 就优先用 **`--fp`**（前提是编译没加 `-fomit-frame-pointer`）。
 *   如果遇到 **`[unknown]`** 太多，请祭出 **`--post-unwind`**。
+
+
+
+编译器选项
+-Xcompiler-option --dump-cfg=$DEVICE_TMP/cfg.txt 
+📌 作用
+
+把 JIT 编译时生成的 控制流图（CFG） dump 出来
+
+📌 具体内容
+
+每个 Java 方法会生成：
+
+BasicBlock
+
+predecessor / successor
+
+HIR（High-level IR）
+
+格式类似：
+
+Method: scimark2.Random.nextDouble
+BB0:
+  HLoadClass
+  HInvokeStatic
+  HGoto -> BB1
+BB1:
+  ...
+
+
+--dump-cfg-append  ：CFG dump 不覆盖，持续往同一个文件里追加
+默认情况下每编译一个方法，都会重新写 cfg.txt，结果是：你只能看到最后一个被编译的方法
+
+-Xcompiler-option --verbose-methods=scimark2.Random.nextDouble
+作用： 只对 指定方法 打印详细编译日志
+-Xcompiler-option --disassemble  把汇编指令打印出来
+
+📌 包含内容
+
+编译开始 / 结束
+
+是否 inline
+
+是否 OSR
+
+编译耗时
+
+使用的优化 Pass
+
+
+
+cfg.txt 文件结构
+[编译信息]
+begin_compilation
+  name "isa:loongarch64..."        # 目标架构
+  method "double jnt.scimark2.Random.nextDouble()"  # 被编译的方法
+  date 1766472927                  # 编译时间戳
+end_compilation
+
+[优化阶段1：构建器]
+begin_cfg
+  name "builder (baseline after)"  # 第一个pass：初始HIR构建
+  <基本块和HIR指令>
+end_cfg
+
+[优化阶段2：常量折叠 - before]
+begin_cfg
+  name "constant_folding (baseline before)"
+  <优化前的HIR>
+end_cfg
+
+[优化阶段2：常量折叠 - after]
+begin_cfg
+  name "constant_folding (baseline after)"
+  <优化后的HIR>
+end_cfg
+
+[优化阶段3：指令简化]
+begin_cfg
+  name "instruction_simplifier (baseline before/after)"
+  ...
+end_cfg
+
+[... 继续多个优化pass ...]
+- dead_code_elimination (死代码消除)
+- inliner (内联)
+- side_effects (副作用分析)
+- GVN (全局值编号)
+- select_generator (选择语句生成)
+- ... 更多优化 ...
+
+[倒数第二个阶段：寄存器分配]
+begin_cfg
+  name "register (baseline after)"  # 第33239行
+  <寄存器分配后的HIR，带有物理寄存器信息>
+end_cfg
+
+[最后阶段：反汇编]
+begin_cfg
+  name "disassembly (baseline after)"  # 第33757行 ← 这就是你要找的！
+  <最终生成的机器码和汇编>
+  0x00000000: 15ffffd2  lu12i.w t6, -2
+  0x00000004: 00108e52  add.d t6, t6, sp
+  ...
+end_cfg
+
+
+adb pull /data/local/art-test-chroot/data/tmp/cfg.txt  可以拿到cfg文件
+grep -n "disassembly" cfg.txt找到最终的汇编
