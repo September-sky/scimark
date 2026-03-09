@@ -30,9 +30,12 @@ ITERATIONS=1
 JIT_MODE="interpreter"
 ENABLE_FLAMEGRAPH=false
 PERF_FREQUENCY=1000
+USE_FP=false
 NO_UNWIND=false
 POST_UNWIND=false
 KEEP_FAILED_UNWIND=false
+ENABLE_COMPILER_DEBUG=false
+MAX_ADDR2LINE=300
 VERBOSE=false
 ENABLE_LOG=false
 LOG_LEVEL=""
@@ -65,6 +68,9 @@ Options:
   --no-unwind                Disable stack unwinding in Simpleperf (faster, but flame graph will be flat)
   --post-unwind              Unwind call stacks after recording (may improve success rate)
   --keep-failed-unwind       Keep failed unwinding debug info for diagnosis
+  --max-addr2line <N>        Max unresolved libartd offsets resolved by addr2line (default: 300)
+
+  --compiler-debug           Enable ART compiler debug dumps (cfg/disassemble/verbose-methods)
   
   --gdb                      Run under gdbserver64 (port :5039)
   --gdb-arg <arg>            Pass option to dalvikvm (can be used multiple times)
@@ -77,11 +83,15 @@ Options:
 
 SciMark Args:
   -large                     Use large dataset
-  <min_time>                 Minimum time per test
+  <min_time>                 Minimum runtime (seconds) for each sub-test.
+                             SciMark will scale inner loops as 1,2,4,8... until
+                             each sub-test reaches <min_time> (not rerunning the whole suite).
+                             To repeat the whole benchmark, use -n/--iterations.
 
 Examples:
   $0                         # Run 1 iteration with JIT
   $0 --interpreter -n 5      # Run 5 iterations in interpreter mode
+  $0 --interpreter -- 1.0    # Pass min_time=1.0 to SciMark (after --)
   $0 --flamegraph -- -large  # Run profiling with large dataset
 EOF
     exit 0
@@ -146,6 +156,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --keep-failed-unwind)
             KEEP_FAILED_UNWIND=true
+            shift
+            ;;
+        --max-addr2line)
+            MAX_ADDR2LINE="$2"
+            shift 2
+            ;;
+        --compiler-debug)
+            ENABLE_COMPILER_DEBUG=true
             shift
             ;;
         --gdb)
@@ -265,6 +283,15 @@ if [ "$GDB_MODE" = true ]; then
     adb forward tcp:5039 tcp:5039
 fi
 
+COMPILER_DEBUG_FLAGS=""
+if [ "$ENABLE_COMPILER_DEBUG" = true ]; then
+    COMPILER_DEBUG_FLAGS=" \
+    -Xcompiler-option --dump-cfg=$DEVICE_TMP/cfg.txt \
+    -Xcompiler-option --dump-cfg-append \
+    -Xcompiler-option --disassemble \
+    -Xcompiler-option --verbose-methods=scimark2.Random.nextDouble"
+fi
+
 # Base Dalvik Command
 DALVIK_CMD="$GDB_PREFIX /apex/com.android.art/bin/dalvikvm64 \
     ${GDB_ARGS[*]} \
@@ -272,10 +299,7 @@ DALVIK_CMD="$GDB_PREFIX /apex/com.android.art/bin/dalvikvm64 \
     -Xbootclasspath-locations:$BCP \
     -Ximage:/apex/com.android.art/javalib/boot.art \
     $JIT_FLAGS \
-    -Xcompiler-option --dump-cfg=$DEVICE_TMP/cfg.txt \
-    -Xcompiler-option --dump-cfg-append \
-    -Xcompiler-option --disassemble \
-    -Xcompiler-option --verbose-methods=scimark2.Random.nextDouble \
+    $COMPILER_DEBUG_FLAGS \
     -Xmx256m \
     -cp $DEVICE_TMP/scimark-dex.jar \
     jnt.scimark2.commandline \
@@ -565,7 +589,7 @@ for i in $(seq 1 $ITERATIONS); do
                     > "$OUTPUT_DIR/out.perf" 2>/dev/null
                  
                  # Check if symbols were resolved
-                 UNRESOLVED_COUNT=$(grep -c '\[+[0-9a-f]\+\]' "$OUTPUT_DIR/out.perf" 2>/dev/null || echo 0)
+                 UNRESOLVED_COUNT=$(grep -oE '\[\+[0-9a-f]+\]' "$OUTPUT_DIR/out.perf" 2>/dev/null | wc -l || echo 0)
                  RESOLVED_COUNT=$(grep -cE 'art::|nterp_|_Z[0-9]+' "$OUTPUT_DIR/out.perf" 2>/dev/null || echo 0)
                  
                  log "Symbol resolution: $RESOLVED_COUNT resolved, $UNRESOLVED_COUNT unresolved"
@@ -578,7 +602,7 @@ for i in $(seq 1 $ITERATIONS); do
                         --symfs "$SYMFS_DIR" \
                         > "$OUTPUT_DIR/out.perf.alt" 2>/dev/null
                      
-                     ALT_UNRESOLVED=$(grep -c '\[+[0-9a-f]\+\]' "$OUTPUT_DIR/out.perf.alt" 2>/dev/null || echo 0)
+                     ALT_UNRESOLVED=$(grep -oE '\[\+[0-9a-f]+\]' "$OUTPUT_DIR/out.perf.alt" 2>/dev/null | wc -l || echo 0)
                      if [ "$ALT_UNRESOLVED" -lt "$UNRESOLVED_COUNT" ]; then
                          log "Alternative symfs produced better results, using it"
                          mv "$OUTPUT_DIR/out.perf.alt" "$OUTPUT_DIR/out.perf"
@@ -593,15 +617,17 @@ for i in $(seq 1 $ITERATIONS); do
                  
                  # 4. Post-process to resolve remaining unresolved symbols using addr2line
                  log "Post-processing unresolved symbols..."
-                 python3 - <<'PYEOF' "$OUTPUT_DIR/out.folded.raw" "$OUTPUT_DIR/out.folded" "$OUTPUT_DIR/binary_cache"
+                 python3 - <<'PYEOF' "$OUTPUT_DIR/out.folded.raw" "$OUTPUT_DIR/out.folded" "$OUTPUT_DIR/binary_cache" "$MAX_ADDR2LINE"
 import sys
 import re
 import subprocess
+from collections import Counter, defaultdict
 from pathlib import Path
 
 input_file = sys.argv[1]
 output_file = sys.argv[2]
 binary_cache = sys.argv[3]
+max_addr2line = int(sys.argv[4])
 
 # Find libartd.so in binary_cache
 libartd_path = None
@@ -615,61 +641,95 @@ if not libartd_path:
         f_out.write(f_in.read())
     sys.exit(0)
 
+line_re = re.compile(r'^(.*)\s+(\d+)$')
+libartd_re = re.compile(r'libartd\.so\[\+([0-9a-f]+)\]')
+dexfile_re = re.compile(r'^dexfile_in_memory_pid_[^;]*\[\+[0-9a-f]+\]$')
+
 # Cache for addr2line results
 addr_cache = {}
 
 def resolve_address(addr_hex):
-    if addr_hex in addr_cache:
-        return addr_cache[addr_hex]
-    
     try:
-        # Use addr2line to get function name
         result = subprocess.run(
             ['addr2line', '-e', libartd_path, '-f', '-C', addr_hex],
             capture_output=True, text=True, timeout=1
         )
-        lines = result.stdout.strip().split('\n')
+        lines = result.stdout.strip().splitlines()
         if len(lines) >= 1 and lines[0] != '??':
             func_name = lines[0]
-            # Clean up function name
             func_name = re.sub(r'\s*\[clone.*?\]$', '', func_name)
-            addr_cache[addr_hex] = func_name
             return func_name
     except:
         pass
-    
-    addr_cache[addr_hex] = None
     return None
 
-# Process folded stacks
-with open(input_file, 'r') as f_in, open(output_file, 'w') as f_out:
+# First pass: parse lines, strip noisy dexfile wrapper frames, and count unresolved offsets.
+entries = []
+addr_counter = Counter()
+with open(input_file, 'r') as f_in:
     for line in f_in:
         line = line.rstrip()
         if not line:
             continue
-        
-        # Check if line contains unresolved libartd.so symbols
-        if 'libartd.so[+' in line:
-            # Extract all unresolved addresses
-            def replace_unresolved(match):
-                addr = match.group(1)
-                resolved = resolve_address(addr)
-                if resolved:
-                    return resolved
-                return match.group(0)  # Keep original if resolution fails
-            
-            line = re.sub(r'libartd\.so\[\+([0-9a-f]+)\]', replace_unresolved, line)
-        
-        f_out.write(line + '\n')
+        m = line_re.match(line)
+        if not m:
+            continue
+        stack = m.group(1)
+        count = int(m.group(2))
+
+        # Drop dexfile offset wrappers when there are deeper frames, to reduce flamegraph noise.
+        frames = stack.split(';')
+        if len(frames) > 2:
+            frames = [f for idx, f in enumerate(frames)
+                      if not (idx < len(frames) - 1 and dexfile_re.match(f))]
+            stack = ';'.join(frames)
+
+        for addr in libartd_re.findall(stack):
+            addr_counter[addr] += count
+        entries.append((stack, count))
+
+# Resolve high-impact unresolved libartd offsets first (avoid very long hangs).
+addresses = [addr for addr, _ in addr_counter.most_common(max_addr2line)]
+for addr in addresses:
+    addr_cache[addr] = resolve_address(addr)
+
+agg = defaultdict(int)
+resolved_count = 0
+for stack, count in entries:
+    def replace_unresolved(match):
+        addr = match.group(1)
+        replacement = addr_cache.get(addr)
+        if replacement:
+            return replacement
+        return match.group(0)
+
+    replaced = libartd_re.sub(replace_unresolved, stack)
+    if replaced != stack:
+        # Approximate resolved entries by comparing unresolved-token count delta.
+        resolved_count += max(0, len(libartd_re.findall(stack)) - len(libartd_re.findall(replaced)))
+    agg[replaced] += count
+
+with open(output_file, 'w') as f_out:
+    for stack in sorted(agg.keys()):
+        f_out.write(f"{stack} {agg[stack]}\n")
+
+print(f"[postprocess] resolved_libartd_offsets={resolved_count}", file=sys.stderr)
+print(f"[postprocess] addr2line_candidates={len(addresses)} (max={max_addr2line})", file=sys.stderr)
 PYEOF
                  
                  # Check resolution improvement
-                 RAW_UNRESOLVED=$(grep -c 'libartd\.so\[+' "$OUTPUT_DIR/out.folded.raw" 2>/dev/null || echo 0)
-                 FINAL_UNRESOLVED=$(grep -c 'libartd\.so\[+' "$OUTPUT_DIR/out.folded" 2>/dev/null || echo 0)
+                 RAW_UNRESOLVED=$(grep -oE 'libartd\.so\[\+[0-9a-f]+\]' "$OUTPUT_DIR/out.folded.raw" 2>/dev/null | wc -l || echo 0)
+                 FINAL_UNRESOLVED=$(grep -oE 'libartd\.so\[\+[0-9a-f]+\]' "$OUTPUT_DIR/out.folded" 2>/dev/null | wc -l || echo 0)
                  RESOLVED_COUNT=$((RAW_UNRESOLVED - FINAL_UNRESOLVED))
                  
                  if [ "$RESOLVED_COUNT" -gt 0 ]; then
                      log "addr2line resolved $RESOLVED_COUNT additional symbols"
+                 fi
+
+                 RAW_DEXFILE=$(grep -oE 'dexfile_in_memory_pid_[^; ]+\[\+[0-9a-f]+\]' "$OUTPUT_DIR/out.folded.raw" 2>/dev/null | wc -l || echo 0)
+                 FINAL_DEXFILE=$(grep -oE 'dexfile_in_memory_pid_[^; ]+\[\+[0-9a-f]+\]' "$OUTPUT_DIR/out.folded" 2>/dev/null | wc -l || echo 0)
+                 if [ "$RAW_DEXFILE" -gt "$FINAL_DEXFILE" ]; then
+                     log "Post-process removed $((RAW_DEXFILE - FINAL_DEXFILE)) noisy dexfile wrapper frames"
                  fi
                  
                  # 4. Generate SVG

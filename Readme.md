@@ -1,212 +1,87 @@
----
+SciMark 使用说明（Loongson Android / ART chroot）
 
-# 📝 性能分析工具：栈展开 (Stack Unwinding) 选项详解
+一、SciMark 支持哪些测试（以及用途）
+  1) FFT (Fast Fourier Transform)
+     用途: 频域变换计算，反映浮点运算与数组访问性能。
+  2) SOR (Successive Over-Relaxation)
+     用途: 迭代求解类计算，反映规则网格上的数值更新吞吐。
+  3) Monte Carlo
+     用途: 随机数与统计计算，反映随机数生成与简单浮点运算性能。
+  4) Sparse matmult
+     用途: 稀疏矩阵乘法，反映内存访问模式与稀疏数据结构处理能力。
+  5) LU
+     用途: LU 分解，反映线性代数类密集计算能力。
+  6) Composite Score
+     用途: 上述 5 项的综合分数。
 
-这些选项主要用于控制 Profiler（如 `simpleperf`）如何从内存中还原函数调用链。选择正确的 Unwind 方式决定了你能否看到完整的火焰图（FlameGraph），以及采样对目标进程的性能影响。
+说明:
+  - SciMark 命令行原生参数主要是:
+    1) -large: 使用更大数据集
+    2) <min_time>: 每个子测试最短运行时长（秒），如 1.0、2.0
+       处理方式: 不是“整套再跑一遍”，而是每个子测试在内部按 1,2,4,8... 次循环加倍，
+       直到该子测试耗时达到 min_time，再用该次结果计分。
+       如果要整套重复跑多轮，请使用脚本参数 -n/--iterations。
 
----
+二、当前目标设备支持情况（实测日期: 2026-03-09）
+  1) 已验证可稳定运行（推荐默认）
+     - 解释器模式: ./run_scimark_la.sh --interpreter -- 1.0 或 2.0
+     - JIT 模式: ./run_scimark_la.sh --jit -- 1.0 或 2.0
+     - large 数据集: ./run_scimark_la.sh --jit -- -large 1.0（可运行但耗时明显增加）
+  2) FlameGraph 可用性
+     - JIT + fp: 可生成且可读性最好（推荐）
+     - Interpreter + fp: 可生成，但常见主热点被 dexfile_in_memory 偏移主导，图可读性较弱
+     - dwarf 展开: 在当前设备上不稳定，容易出现 "cfa is not set to a register" 报错
+  3) 已知限制
+     - 当前环境通常找不到 perf-*.map，JIT 相关符号可能不完整
+     - 即使开启后处理，仍可能有少量 libartd.so[+offset] 或 unknown 残留
 
-## 1. `--fp` (Frame Pointer Unwinding)
+三、目标设备脚本用法
+  1) 基本格式
+     ./run_scimark_la.sh [脚本参数] -- [SciMark 参数]
+  2) 常用脚本参数
+     --interpreter              解释器模式（默认）
+     --switch-interpreter       switch 解释器模式
+     --jit                      JIT 模式
+     --jit-baseline             JIT baseline 模式
+     --jit-on-first-use         JIT 阈值设为 0
+     -n, --iterations N         迭代次数
+     --flamegraph               开启 simpleperf + 火焰图
+     --flamegraph-output PATH   指定火焰图输出路径
+     --perf-frequency HZ        采样频率（默认 1000）
+     --fp                       使用 frame pointer 展开（推荐）
+     --no-unwind                不做栈展开（仅热点，不看调用链）
+     --post-unwind              录制后展开
+     --keep-failed-unwind       保留失败展开调试信息
+     --max-addr2line N          限制 addr2line 解析数量（默认 300）
+     --compiler-debug           打开 cfg/disassemble/verbose-methods 调试输出
+     -o, --output DIR           结果目录
+     -v, --verbose              打印详细命令
 
-> **核心特征：** 依赖寄存器 `RBP` 链表，速度快，稳定性高。
+四、已验证可用命令
+  1) 快速冒烟（解释器）
+     ./run_scimark_la.sh --interpreter -- 1.0
+  2) 稳定性能跑分（JIT，推荐）
+     ./run_scimark_la.sh --jit -- 2.0
+  3) 推荐火焰图（JIT，推荐）
+     ./run_scimark_la.sh --jit --flamegraph --fp --perf-frequency 400 -- 2.0
+  4) 解释器火焰图（可用但可读性一般）
+     ./run_scimark_la.sh --interpreter --flamegraph --fp --perf-frequency 400 -- 1.0
+  5) 需要编译器 CFG / 反汇编时
+     ./run_scimark_la.sh --jit --compiler-debug --flamegraph --fp -- 2.0
 
-*   **含义**：使用帧指针（Frame Pointer）进行栈展开。
-*   **原理**：
-    在 x86-64 架构中，标准函数调用头部通常包含：
-    ```asm
-    push rbp      ; 保存上一帧的 rbp
-    mov rbp, rsp  ; 当前 rbp 指向栈顶
-    ```
-    这使得栈帧在内存中形成一个链表结构：`当前 RBP -> 上一帧 RBP -> 上上一帧 RBP ...`。Profiler 只需读取 `RBP` 寄存器即可顺藤摸瓜。
-*   **优点**：
-    *   ✅ **极度稳定**：不依赖复杂的 DWARF 调试信息表。
-    *   ✅ **开销极低**：逻辑简单，甚至不需要读取磁盘上的二进制文件。
-*   **缺点**：
-    *   ❌ **编译依赖**：目标程序必须在编译时保留帧指针（需添加编译参数 `-fno-omit-frame-pointer`）。如果程序编译时使用了 `-fomit-frame-pointer`（常见于优化后的 Release 版本），`RBP` 会被当作通用寄存器，导致展开失败。
-*   **适用场景**：
-    *   **Android 系统组件 / ART 虚拟机**（通常系统库都保留了 FP）。
-    *   **解释器 / JIT 环境**（Java, Python, Node.js 等动态生成的代码）。
-    *   **Chroot 环境**（因为找不到外部的 debug info 文件）。
+五、结果目录与产物
+  1) 默认输出目录
+     ./device-perf-result/<时间戳>-<模式>/
+  2) 常见文件
+     perf.data             原始采样数据
+     report_symbol.txt     按符号统计的文本报告
+     report_callgraph.txt  调用链文本报告
+     out.perf              report_sample 产物
+     out.folded            折叠栈（用于火焰图）
+     flamegraph.svg        火焰图
+     run.log               本次运行日志
 
----
-
-## 2. `--no-unwind`
-
-> **核心特征：** 放弃调用链，只看“叶子函数”。
-
-*   **含义**：完全禁用栈展开。
-*   **原理**：
-    Profiler 每次采样只记录当前的 Program Counter (PC) 指针，不向上追溯是谁调用了它。
-*   **结果**：
-    *   生成的火焰图是“平”的（只有一层），全是由于函数本身执行指令产生的热点。
-    *   输出示例：`main`, `funcA`, `funcB` 各自独立，看不出 `main -> funcA -> funcB`。
-*   **优点**：
-    *   ✅ **性能开销最小**：几乎零额外负载，对被测程序影响微乎其微。
-*   **缺点**：
-    *   ❌ **上下文丢失**：无法得知调用路径，难以进行复杂的逻辑分析。
-*   **适用场景**：
-    *   只需要知道哪个函数最耗时（Hotspot），不关心调用路径。
-    *   系统负载极高，不能承受额外的 Unwind 开销时。
-
----
-
-## 3. `--post-unwind`
-
-> **核心特征：** 采样时“偷懒”，录制完后“算总账”。
-
-*   **含义**：先将原始的栈内存数据录制下来，等 Profiling 结束后（离线）再进行栈展开。
-*   **原理**：
-    *   **默认模式**：采样中断发生时，立即在当前上下文解析 DWARF 或 FP。
-    *   **Post 模式**：采样时只把栈顶的一块内存（Stack Copy）复制到磁盘。结束后，利用完整的符号表、DWARF 信息和离线算法进行重建。
-*   **优点**：
-    *   ✅ **成功率最高**：离线分析可以使用更复杂的重试策略（如果 DWARF 失败则尝试 FP，反之亦然）。
-    *   ✅ **支持不完整环境**：即使采样时寄存器状态不稳定（如在 Signal Handler 中），离线分析也能通过上下文推断恢复。
-*   **缺点**：
-    *   ❌ **空间占用大**：需要把大量原始栈数据写入 `perf.data`，导致文件体积暴增。
-    *   ❌ **后处理慢**：录制完后需要很长时间生成报告。
-*   **适用场景**：
-    *   默认 Unwind 经常失败（火焰图中出现大量 `[unknown]` 或断层）。
-    *   混合环境分析（Native + JIT + Stripped Binary）。
-
----
-
-## 4. `--keep-failed-unwind`
-
-> **核心特征：** 调试“Profiling 工具本身”的调试开关。
-
-*   **含义**：当栈展开失败时，保留当时的寄存器和栈信息，而不是丢弃。
-*   **用途**：
-    它不是为了分析你的代码性能，而是为了分析 **“为什么栈展开会失败”**。
-    它会记录失败原因：
-    *   `DWARF rule mismatch`（调试信息对不上）
-    *   `CFA not found`（找不到规范帧地址）
-    *   `RBP chain broken`（帧指针链断裂）
-*   **适用场景**：
-    *   你在开发 Profiler 工具。
-    *   通过 `simpleperf` 调试某个特定的库为何无法生成火焰图。
-    *   **日常性能分析不需要开启**（会产生巨大垃圾数据）。
-
----
-
-## 🚀 速查表 (Cheat Sheet)
-
-| 场景需求 | 推荐参数 | 原因 |
-| :--- | :--- | :--- |
-| **通用 / 各种都想试一下** | (默认) 或 `--fp` | 默认通常是 DWARF，`--fp` 在 Android/JIT 上更稳。 |
-| **Android / Java / ART** | **`--fp`** | Android 库通常带有 FP，且 ART 虚拟机对 DWARF 支持不如 FP 好。 |
-| **Unwind 总是断掉 / 失败** | **`--fp --post-unwind`** | 结合 FP 的稳定性 + 离线分析的容错能力。 |
-| **极低开销 / 只要热点函数** | **`--no-unwind`** | 牺牲调用链换取最小性能损耗。 |
-| **调试 Unwind 问题** | `--post-unwind --keep-failed-unwind` | 仅用于诊断工具问题。 |
-
-### 💡 核心结论
-*   能用 **`--fp`** 就优先用 **`--fp`**（前提是编译没加 `-fomit-frame-pointer`）。
-*   如果遇到 **`[unknown]`** 太多，请祭出 **`--post-unwind`**。
-
-
-
-编译器选项
--Xcompiler-option --dump-cfg=$DEVICE_TMP/cfg.txt 
-📌 作用
-
-把 JIT 编译时生成的 控制流图（CFG） dump 出来
-
-📌 具体内容
-
-每个 Java 方法会生成：
-
-BasicBlock
-
-predecessor / successor
-
-HIR（High-level IR）
-
-格式类似：
-
-Method: scimark2.Random.nextDouble
-BB0:
-  HLoadClass
-  HInvokeStatic
-  HGoto -> BB1
-BB1:
-  ...
-
-
---dump-cfg-append  ：CFG dump 不覆盖，持续往同一个文件里追加
-默认情况下每编译一个方法，都会重新写 cfg.txt，结果是：你只能看到最后一个被编译的方法
-
--Xcompiler-option --verbose-methods=scimark2.Random.nextDouble
-作用： 只对 指定方法 打印详细编译日志
--Xcompiler-option --disassemble  把汇编指令打印出来
-
-📌 包含内容
-
-编译开始 / 结束
-
-是否 inline
-
-是否 OSR
-
-编译耗时
-
-使用的优化 Pass
-
-
-
-cfg.txt 文件结构
-[编译信息]
-begin_compilation
-  name "isa:loongarch64..."        # 目标架构
-  method "double jnt.scimark2.Random.nextDouble()"  # 被编译的方法
-  date 1766472927                  # 编译时间戳
-end_compilation
-
-[优化阶段1：构建器]
-begin_cfg
-  name "builder (baseline after)"  # 第一个pass：初始HIR构建
-  <基本块和HIR指令>
-end_cfg
-
-[优化阶段2：常量折叠 - before]
-begin_cfg
-  name "constant_folding (baseline before)"
-  <优化前的HIR>
-end_cfg
-
-[优化阶段2：常量折叠 - after]
-begin_cfg
-  name "constant_folding (baseline after)"
-  <优化后的HIR>
-end_cfg
-
-[优化阶段3：指令简化]
-begin_cfg
-  name "instruction_simplifier (baseline before/after)"
-  ...
-end_cfg
-
-[... 继续多个优化pass ...]
-- dead_code_elimination (死代码消除)
-- inliner (内联)
-- side_effects (副作用分析)
-- GVN (全局值编号)
-- select_generator (选择语句生成)
-- ... 更多优化 ...
-
-[倒数第二个阶段：寄存器分配]
-begin_cfg
-  name "register (baseline after)"  # 第33239行
-  <寄存器分配后的HIR，带有物理寄存器信息>
-end_cfg
-
-[最后阶段：反汇编]
-begin_cfg
-  name "disassembly (baseline after)"  # 第33757行 ← 这就是你要找的！
-  <最终生成的机器码和汇编>
-  0x00000000: 15ffffd2  lu12i.w t6, -2
-  0x00000004: 00108e52  add.d t6, t6, sp
-  ...
-end_cfg
-
-
-adb pull /data/local/art-test-chroot/data/tmp/cfg.txt  可以拿到cfg文件
-grep -n "disassembly" cfg.txt找到最终的汇编
+六、实测建议
+  1) 如果目标是“看业务热点”，优先使用 JIT + fp 火焰图。
+  2) 如果目标是“排查解释器路径”，可用 interpreter + fp，但需接受图可读性下降。
+  3) 如果火焰图后处理耗时过长，可降低 --max-addr2line（例如 80）。
